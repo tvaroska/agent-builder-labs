@@ -1,23 +1,30 @@
 ---
 name: tokenomics-analytics
-description: Enforces Tokenomics-governed BigQuery analytics by consulting Knowledge Catalog first, answering metric and schema questions at zero scan cost, and building a partition-enforcing Python BigQuery CLI inside code_execution with zero BigQuery MCP dependency.
+description: Self-contained Tokenomics-governed BigQuery analytics skill defining canonical Google Analytics semantic metrics, _TABLE_SUFFIX partition rules, and a zero-secret sandboxed Python BigQuery REST runner.
 ---
 
 # Tokenomics-Governed BigQuery Analytics Skill
 
-Follow this three-step sequence whenever answering analytics, metric formula, schema, or BigQuery data questions.
+Follow this workflow whenever answering metric definitions, schema questions, or live BigQuery analytics queries on `bigquery-public-data.google_analytics_sample.ga_sessions_*`.
 
-## 1. Mandatory Knowledge Catalog First (Zero-Scan Circuit Breaker)
+## 1. Canonical Semantic Definitions & Zero-Scan Rule
 
-- Whenever `knowledge-catalog-mcp` tools (`search_knowledge_catalog`, `get_semantic_metric`, `get_table_metadata`) are attached, consult them **before** touching BigQuery.
-- For conceptual or metadata questions (such as *"What is our business formula for bounce rate?"*, *"What datasets are available?"*, or *"What are the partition rules for `ga_sessions`?"*):
-  - Answer strictly from Knowledge Catalog results.
-  - Do **not** run any BigQuery jobs or table scans.
+For conceptual, metric formula, or partition metadata questions, answer **strictly from the definitions below** (and cross-check `knowledge-catalog-mcp` tools only if attached on the agent). **Never run a BigQuery scan just to look up a metric formula or partition rule:**
+
+- **Dataset & Table Pattern:** `bigquery-public-data.google_analytics_sample.ga_sessions_*`
+  - **Partition Key:** `_TABLE_SUFFIX` (string format `YYYYMMDD`, e.g. `_TABLE_SUFFIX = '20170801'`).
+  - **Optimization Rule:** Always filter `WHERE _TABLE_SUFFIX = 'YYYYMMDD'` (or `BETWEEN '...' AND '...'`) to avoid full wildcard scans.
+- **Official Metric — `bounce_rate` (Bounce Rate):**
+  - **Definition:** Percentage of single-interaction visits where the visitor leaves from the entrance page without further actions.
+  - **Canonical SQL Formula:** `SUM(IFNULL(totals.bounces, 0)) / COUNT(totals.visits)` (equivalently `COUNTIF(totals.bounces = 1) / COUNT(totals.visits)`).
+- **Official Metric — `monthly_active_users` (Monthly Active Users / MAU):**
+  - **Definition:** Count of distinct active visitors across a rolling 30-day `_TABLE_SUFFIX` window.
+  - **Canonical SQL Formula:** `COUNT(DISTINCT fullVisitorId)` filtered by a 30-day `_TABLE_SUFFIX` range.
 
 <!-- PROTECTED:START -->
 ## 2. Non-Negotiable Sandbox & SQL Governance Guardrails (Immutable)
 
-When live row values or aggregations are required, build and execute `/tmp/bq_runner.py` (and mirror a copy to `./bq_runner.py` in the workspace root) inside `code_execution` using Python's standard library (`urllib.request`, `json`, `os`, `re`, `shutil`, `sys`):
+When live row values or aggregations are requested, build and execute `/tmp/bq_runner.py` (and copy a mirror to `./bq_runner.py` in the workspace root) inside `code_execution` using Python's standard library (`urllib.request`, `json`, `os`, `re`, `shutil`, `sys`):
 
 1. **Zero Ambient Secrets in Code:**
    - Read the billing project from `os.environ["GOOGLE_CLOUD_PROJECT"]`.
@@ -30,11 +37,11 @@ When live row values or aggregations are required, build and execute `/tmp/bq_ru
    - First `POST` `{"query": sql, "useLegacySql": false, "dryRun": true}`.
    - Parse `totalBytesProcessed` from the JSON response and abort if `int(totalBytesProcessed) > 100_000_000` (`100 MB`).
 4. **Partition-Safe Execution (`dryRun: false`):**
-   - `POST` `{"query": sql, "useLegacySql": false, "maximumBytesBilled": "100000000"}` (for `bigquery-public-data.google_analytics_sample.ga_sessions_*`, filter `_TABLE_SUFFIX = '20170801'` for single-day or `_TABLE_SUFFIX BETWEEN ...` for date ranges).
+   - `POST` `{"query": sql, "useLegacySql": false, "maximumBytesBilled": "100000000"}` (filtering `_TABLE_SUFFIX = '20170801'` for August 1, 2017).
    - Zip `schema.fields` names with each row's `f[].v` values and print structured JSON including `dry_run_bytes` and `rows`.
 <!-- PROTECTED:END -->
 
 ## 3. Grounded Reporting
 
-- Cite the `_TABLE_SUFFIX` partition filter, `dry_run_bytes` processed, and Knowledge Catalog definition used.
+- Cite the `_TABLE_SUFFIX` partition filter, `dry_run_bytes` processed, and canonical metric formula used.
 - Every numerical figure in the final response must match the `/tmp/bq_runner.py` output verbatim.

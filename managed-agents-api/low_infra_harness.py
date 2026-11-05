@@ -1,29 +1,85 @@
-"""Minimal stateful interaction harnesses on the Gemini Platform.
+"""Shared Managed Agents & `/interactions` helpers for Lab 5.
 
-Contrasts two low-infrastructure patterns that avoid deploying custom agent
-containers or multi-service orchestration frameworks:
-1. Managed Agent Harness (`run_managed_interaction`): delegates tool loops,
-   sandbox code building/execution, and skill discovery to a server-managed
-   Agent resource, using host egress proxy `transform` headers so sandboxed
-   Python tools can query BigQuery REST APIs with zero MCP server and zero
-   secrets inside sandbox memory.
-2. Thin Model Harness (`run_thin_model_turn`): drives a foundation model over
-   `POST .../interactions` using `previous_interaction_id` so `thought_signature`
-   and prefix-cache affinity stay server-side without resending history arrays,
-   or `store=False` for stateless Zero Data Retention (ZDR).
-
-Run `python low_infra_harness.py` to execute the Part B live demo comparing
-stateful `previous_interaction_id` caching against `store=False` ZDR mode.
+Provides:
+1. State & project helpers (`resolve_project_id`, `load_lab_state`, `save_lab_state`)
+   so Steps 1–4 run seamlessly in a fresh Qwiklabs Cloud Shell environment.
+2. Managed Agent harness (`run_managed_interaction`, `build_bigquery_proxy_environment`,
+   `inspect_sandbox_environment`) supporting initial interactions, chained
+   `previous_interaction_id` follow-ups, persistent `environment_id` sandboxes,
+   and zero-secret host egress proxy `transform` BigQuery authentication.
+3. Optional thin model-only harness (`python low_infra_harness.py`) comparing
+   `previous_interaction_id` caching against `store=False` Zero Data Retention.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import pathlib
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
+
+LAB_DIR = pathlib.Path(__file__).resolve().parent
+STATE_FILE = LAB_DIR / ".lab_state.json"
+
+
+def resolve_project_id() -> str:
+    """Resolves active GCP project from env, Qwiklabs Cloud Shell, or gcloud."""
+    project_id = (
+        os.getenv("GOOGLE_CLOUD_PROJECT")
+        or os.getenv("DEVSHELL_PROJECT_ID")
+        or os.getenv("CLOUDSDK_CORE_PROJECT")
+    )
+    if project_id:
+        return project_id.strip()
+
+    proc = subprocess.run(
+        ["gcloud", "config", "get-value", "project"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    detected = (proc.stdout or "").strip()
+    if detected and detected != "(unset)":
+        return detected
+    raise ValueError(
+        "No Google Cloud project detected. Run 'gcloud config set project <PROJECT_ID>' "
+        "or export GOOGLE_CLOUD_PROJECT."
+    )
+
+
+def load_lab_state(state_file: pathlib.Path = STATE_FILE) -> dict[str, Any]:
+    """Loads persisted step-to-step IDs (`.lab_state.json`) if present."""
+    if not state_file.exists():
+        return {}
+    return json.loads(state_file.read_text(encoding="utf-8"))
+
+
+def save_lab_state(
+    updates: dict[str, Any],
+    *,
+    env_id: str | None = None,
+    state_file: pathlib.Path = STATE_FILE,
+) -> dict[str, Any]:
+    """Merges step state into `.lab_state.json` and tracks created sandbox IDs."""
+    state = load_lab_state(state_file)
+    state.update(updates)
+    envs: list[str] = list(state.get("environments") or [])
+    if env_id and env_id not in envs:
+        envs.append(env_id)
+    state["environments"] = envs
+    state_file.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    return state
+
+
+def clear_lab_state(state_file: pathlib.Path = STATE_FILE) -> None:
+    """Removes `.lab_state.json` after cleanup."""
+    if state_file.exists():
+        state_file.unlink()
 
 
 @dataclass
@@ -171,14 +227,14 @@ def run_managed_interaction(
     """Streams a single turn against a Managed Agent and extracts state handles.
 
     Supports all three state patterns on a reusable Managed Agent (`agent`):
-    1. First interaction: omit `previous_interaction_id` and `environment_id` to
-       start a new conversation and provision a fresh 7-day Linux sandbox.
-    2. Session follow-up: pass `previous_interaction_id` (chaining conversation
+    1. First interaction (Step 2): omit `previous_interaction_id` and `environment_id`
+       to start a new conversation and provision a fresh 7-day Linux sandbox.
+    2. Session follow-up (Step 3): pass `previous_interaction_id` (chaining conversation
        `steps[]` & `thought` context) together with `environment_id` (reattaching
        to the persistent Linux sandbox where agent-built scripts reside).
-    3. Fresh agent reuse: call the same `agent` ID again without
-       `previous_interaction_id` or `environment_id` to serve a new user or task
-       in a clean, isolated sandbox.
+    3. New interaction on existing agent (Step 4): call the same `agent` ID again
+       without `previous_interaction_id` or `environment_id` to serve a new user or
+       task in a clean, isolated sandbox.
     """
     if not store and previous_interaction_id is not None:
         raise ValueError("previous_interaction_id requires store=True.")
@@ -262,14 +318,7 @@ def run_thin_model_turn(
     previous_interaction_id: str | None = None,
     store: bool = True,
 ) -> Any:
-    """Executes one stateful or ZDR model turn over the Interactions API.
-
-    Note: `previous_interaction_id` chains conversation `steps[]` (including
-    encrypted `thought` signatures for ~90% multi-turn prefix cache hit rates),
-    whereas `system_instruction` and `tools` are turn-scoped and must be passed
-    on every turn. Setting `store=False` enables stateless Zero Data Retention
-    (ZDR) mode, which cannot be combined with `previous_interaction_id`.
-    """
+    """Executes one stateful or ZDR model turn over the Interactions API."""
     if not store and previous_interaction_id is not None:
         raise ValueError("previous_interaction_id requires store=True.")
 
@@ -304,16 +353,13 @@ def _format_usage(interaction: Any) -> str:
 
 
 def run_part_b_demo(model: str = "gemini-3.8-flash") -> None:
-    """Runs Part B live demo: stateful `previous_interaction_id` vs `store=False` ZDR."""
+    """Runs optional bonus demo: model `previous_interaction_id` vs `store=False` ZDR."""
     from dotenv import load_dotenv
     from google import genai
 
-    load_dotenv()
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
-    if not project_id:
-        raise ValueError("GOOGLE_CLOUD_PROJECT is required to run the live Part B demo.")
-
-    catalog_mcp_url = os.getenv("CATALOG_MCP_URL")
+    load_dotenv(LAB_DIR / ".env")
+    project_id = resolve_project_id()
+    catalog_mcp_url = os.getenv("CATALOG_MCP_URL") or None
     tools = (
         [{"type": "mcp_server", "name": "knowledge-catalog-mcp", "url": catalog_mcp_url}]
         if catalog_mcp_url
@@ -328,7 +374,7 @@ def run_part_b_demo(model: str = "gemini-3.8-flash") -> None:
     stored_ids: list[str] = []
 
     try:
-        print(f"=== Part B.1: Stateful Chaining via previous_interaction_id (model={model}) ===")
+        print(f"=== Bonus Demo: Stateful Model Chaining via previous_interaction_id ({model}) ===")
         t1 = run_thin_model_turn(
             client,
             model=model,
@@ -360,7 +406,7 @@ def run_part_b_demo(model: str = "gemini-3.8-flash") -> None:
         print(f"\n[Turn 2 — Chained] id={t2.id} (prev={t1.id}) | {_format_usage(t2)}")
         print(t2.output_text)
 
-        print(f"\n=== Part B.2: Stateless Zero Data Retention Mode (store=False, model={model}) ===")
+        print(f"\n=== Bonus Demo: Stateless Zero Data Retention Mode (store=False, {model}) ===")
         zdr_turn = run_thin_model_turn(
             client,
             model=model,
@@ -377,12 +423,12 @@ def run_part_b_demo(model: str = "gemini-3.8-flash") -> None:
             except Exception:  # noqa: BLE001, S110
                 pass
         if stored_ids:
-            print(f"\nCleaned up {len(stored_ids)} stored interaction(s).")
+            print(f"\nCleaned up {len(stored_ids)} stored model interaction(s).")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run Lab 5 Part B thin `/interactions` harness live demo."
+        description="Run optional bonus thin `/interactions` model demo."
     )
     parser.add_argument(
         "--model",
