@@ -2,16 +2,22 @@
 
 In **Lab 4** ([`../data_analytics_agent/`](../data_analytics_agent/)), we built a code-first **ADK Worker Agent** requiring custom Python agent classes, `BigQueryToolset` wrappers, session services, and container deployment.
 
-In **Lab 5**, we solve the **same Tokenomics-governed analytics problem on the Qwiklabs dataset (`ga_sessions_*`) with zero container build and zero BigQuery MCP server** using two low-infrastructure primitives on Google Cloud's **Gemini Platform** (`google-genai >= 2.4.0`):
+In **Lab 5**, we solve the **same Tokenomics-governed analytics problem on the Qwiklabs dataset (`ga_sessions_*`) with zero container build and zero BigQuery MCP server** using Google Cloud's **Gemini Platform** (`google-genai >= 2.4.0`).
 
-1. **Part A — Config-First Managed Agents API (`client.agents` + `client.interactions` + `client.environments`):**
-   - Provision a stateful custom agent on the control plane (`POST /v1beta1/projects/{P}/locations/global/agents`) in a single declarative call (with optional `agent_config` model & `max_total_tokens` cap).
-   - Mount a portable [`skills/tokenomics-analytics/SKILL.md`](skills/tokenomics-analytics/SKILL.md) package (from **Skill Registry**, **Cloud Storage**, or **inline**) containing an immutable `<!-- PROTECTED:START -->` compliance block.
-   - Attach **Lab 2's `knowledge-catalog-mcp`** strictly for semantic catalog discovery, while the Managed Agent **writes, unit-tests, and runs its own Python BigQuery CLI (`/tmp/bq_runner.py` & `./bq_runner.py`) inside `code_execution` with zero BigQuery MCP dependency**.
-   - Authenticate outbound sandbox calls to `bigquery.googleapis.com` via **host egress proxy header injection (`network.allowlist[].transform`)** so **zero OAuth tokens or credentials ever enter sandbox memory, disk, or env vars**.
-   - Reuse and inspect the returned **`environment_id`** (`7-day` rolling TTL Linux sandbox via `client.environments`) across turns, and pass `tools=[{"type": "code_execution"}]` on Turn 3 to prove BigQuery runs purely via the agent-built script.
-2. **Part B — Thin Stateful Model Harness (`low_infra_harness.py`):**
-   - For teams wanting a lightweight custom loop without adopting a full agent framework, `python low_infra_harness.py` drives `gemini-3.8-flash` / `gemini-4-argon` directly over `POST .../interactions`—comparing **`previous_interaction_id`** (retaining encrypted `thought` signatures and warm replica KV-cache affinity server-side) against **`store=False`** for 100% stateless Zero Data Retention (ZDR).
+---
+
+## The 4 Core Managed Agent Lifecycle Steps (Part A)
+
+This lab walks explicitly through the four foundational lifecycle operations of the **Managed Agents API** (`client.agents`), **Interactions API** (`client.interactions`), and **Environments API** (`client.environments`):
+
+| Step | Capability | SDK Call & State Handles | What Happens in This Lab |
+| :--- | :--- | :--- | :--- |
+| **1. Create the Agent** | Provision a reusable control-plane agent definition once | `client.agents.create(id=..., base_agent=..., system_instruction=..., tools=..., base_environment=...)` $\rightarrow$ `MANAGED_AGENT_ID` | Registers a custom agent mounting [`skills/tokenomics-analytics/SKILL.md`](skills/tokenomics-analytics/SKILL.md) (with an immutable `<!-- PROTECTED:START -->` compliance block), `code_execution`, and Lab 2's `knowledge-catalog-mcp`. |
+| **2. Use the Agent with Interactions API** | Start an initial interaction against the agent | `client.interactions.create(agent=MANAGED_AGENT_ID, input=..., stream=True)` $\rightarrow$ returns `t1.interaction_id` + `t1.environment_id` | **Session A — Turn 1:** Streams SSE events (`step.start`, `step.delta`) while resolving `bounce_rate` and `ga_sessions` `_TABLE_SUFFIX` partition rules from the Knowledge Catalog with **zero BigQuery scan**. |
+| **3. Follow Up on Previous Interaction** | Continue the same conversation & persistent sandbox | `client.interactions.create(agent=MANAGED_AGENT_ID, previous_interaction_id=t1.interaction_id, environment={..., "environment_id": t1.environment_id}, ...)` | **Session A — Turns 2 & 3:** Chains conversation memory (`previous_interaction_id`) **and** reattaches to the `7-day` Linux sandbox (`environment_id`) so the agent builds, unit-tests, and executes `/tmp/bq_runner.py` against `bigquery.googleapis.com` via zero-secret proxy header injection (`network.allowlist[].transform`) with **zero MCP attached** on Turn 3. |
+| **4. Reuse the Agent for Next Interaction** | Invoke the same `agent` for a brand-new session/user | `client.interactions.create(agent=MANAGED_AGENT_ID, input=...)` *(omits `previous_interaction_id` and `environment_id`)* $\rightarrow$ new `t4.interaction_id` + clean `t4.environment_id` | **Session B — Turn 1:** Reuses the exact same `MANAGED_AGENT_ID` control-plane definition in a fresh conversation and clean, isolated sandbox (verifying `monthly-active-users` formula and confirming Session A's `/tmp/bq_runner.py` is absent). |
+
+> **Part B Bonus (`low_infra_harness.py`):** For teams driving foundation models (`gemini-3.8-flash` / `gemini-4-argon`) directly without an autonomous sandbox agent, **Lab Step 5** compares multi-turn `previous_interaction_id` prefix-cache & `thought` chaining against `store=False` stateless Zero Data Retention (ZDR).
 
 ---
 
@@ -19,32 +25,37 @@ In **Lab 5**, we solve the **same Tokenomics-governed analytics problem on the Q
 
 ```mermaid
 flowchart LR
-    DEV["Developer / CI-CD\n(google-genai >= 2.4.0)"] -->|"1. Control Plane:\nclient.agents.create()"| AGENT["Managed Agent Resource\n(locations/global/agents/{id})"]
-    DEV -->|"2. Data Plane:\nclient.interactions.create(env_id)"| INT["Interactions API\n(SSE Stream + 7d Sandbox)"]
+    DEV["Developer / CI-CD\n(google-genai >= 2.4.0)"] -->|"Step 1: Create Agent\nclient.agents.create()"| AGENT["Managed Agent Resource\n(locations/global/agents/{id})"]
+    DEV -->|"Step 2: First Interaction\nagent=ID"| S1["Session A (env_A)\nTurn 1 -> Turn 2 -> Turn 3\n(previous_interaction_id + env_A)"]
+    DEV -->|"Step 4: Reuse Agent\nagent=ID (no prev_id / env_id)"| S2["Session B (env_B)\nFresh Conversation +\nClean Isolated Sandbox"]
 
-    subgraph SANDBOX["Managed Remote Sandbox (environment_id — Zero Ambient Secrets)"]
+    AGENT -.-> S1
+    AGENT -.-> S2
+
+    subgraph SANDBOX["Session A Sandbox (env_A — Zero Ambient Secrets)"]
         SKILL["Mounted SKILL.md\n(PROTECTED Guardrails)"]
         CLI["Agent-Built bq_runner.py\n(SQL Guard + dryRun<=100MB)"]
     end
 
     PROXY["Host Egress Proxy\n(allowlist transform:\nBearer + X-Goog-User-Project)"]
 
-    INT --> SANDBOX
-    INT -->|"Turns 1-2: Remote MCP (SSE)"| MCP["Lab 2: knowledge-catalog-mcp\n(Dataplex Semantic Definitions)"]
-    CLI -->|"Turn 3: Plain HTTPS\n(Zero MCP)"| PROXY -->|"Authenticated REST"| BQ["BigQuery\n(ga_sessions_20170801)"]
+    S1 --> SANDBOX
+    S1 -->|"Step 2 & 3a: Remote MCP"| MCP["Lab 2: knowledge-catalog-mcp\n(Dataplex Semantic Definitions)"]
+    S2 -->|"Step 4: Remote MCP"| MCP
+    CLI -->|"Step 3b: Plain HTTPS\n(Zero MCP)"| PROXY -->|"Authenticated REST"| BQ["BigQuery\n(ga_sessions_20170801)"]
 ```
 
-### Model Interactions vs. Managed Agent Interactions
+### State Primitives at a Glance
 
-| Dimension | **Thin Model Interactions (`Part B`)** | **Managed Agent Interactions (`Part A`)** |
-| :--- | :--- | :--- |
-| **Target Parameter** | `model="gemini-3.8-flash"` (or `"gemini-4-argon"`) | `agent="<MANAGED_AGENT_ID>"` |
-| **Multi-Turn Continuity** | **Immutable Turn Chain:** Each turn mints a new `interaction.id` linked via `previous_interaction_id` (`system_instruction` and `tools` are turn-scoped). | **Durable Task & Persistent Sandbox:** Backed by a server-managed task + `environment_id` (`7-day` rolling TTL Linux workspace inspectable via `client.environments`). |
-| **Zero Data Retention (ZDR)** | Pass `store=False` (stateless `steps[]` response; incompatible with `previous_interaction_id`). | Zero ambient credentials in sandbox; delete stored interactions/environments on close. |
+| State Handle | Scope | What It Preserves Across Calls | When to Pass vs. Omit |
+| :--- | :--- | :--- | :--- |
+| **`agent`** (`MANAGED_AGENT_ID`) | **Control Plane (Project-wide)** | `base_agent`, `system_instruction`, mounted `SKILL.md`, default `tools`, and default `network.allowlist`. | **Pass on every call** to reuse the same governed agent across all sessions and users. |
+| **`previous_interaction_id`** | **Conversation History (`steps[]`)** | Prior user/agent messages, tool call outputs, and encrypted `thought` lineage (`store=True` required). | **Pass in Step 3** to follow up on a prior turn; **omit in Step 4** to start a fresh conversation. |
+| **`environment_id`** | **Remote Sandbox Disk (`7-day` TTL)** | Workspace & `/tmp` files written inside `code_execution` (inspectable via `client.environments`). | **Pass in Step 3** to keep `/tmp/bq_runner.py` across turns; **omit in Step 4** for a clean isolated sandbox. |
 
 ---
 
-## Step 1: Prerequisites & Setup
+## Prerequisites: Setup & Offline Contract Check
 
 Ensure **Lab 1** (`knowledgeCatalog-bigquery-sync`) and **Lab 2** (`create-knowledge-catalog-mcp-server`) have been deployed in your Qwiklabs / Google Cloud project, then run:
 
@@ -54,15 +65,9 @@ chmod +x instructions.sh
 ./instructions.sh
 ```
 
-`instructions.sh` enables required APIs, grants `roles/aiplatform.serviceAgent` to the platform service identity, stages [`skills/tokenomics-analytics/SKILL.md`](skills/tokenomics-analytics/SKILL.md) to `gs://<PROJECT_ID>-managed-agent-skills`, and installs `google-genai>=2.4.0`.
+`instructions.sh` enables required APIs, grants `roles/aiplatform.serviceAgent` to the platform service identity, stages [`skills/tokenomics-analytics/SKILL.md`](skills/tokenomics-analytics/SKILL.md) to `gs://<PROJECT_ID>-managed-agent-skills`, and installs `google-genai>=2.4.0`. *(Leave `AGENT_SKILL_GCS_BUCKET` unset if you prefer zero-setup inline `SKILL.md` mounting.)*
 
-*(Want zero Cloud Storage setup? Leave `AGENT_SKILL_GCS_BUCKET` unset—`create_managed_agent.py` automatically mounts `SKILL.md` inline inside `base_environment.sources`.)*
-
----
-
-## Step 2: Run Offline Contract Tests (`<1s`, No Cloud Calls Required)
-
-Verify the `SKILL.md` `PROTECTED` compliance block, `agent_config` validation, proxy header `transform` isolation (confirming tokens never enter `environment.env`), SSE `environment_id` fallback hydration, and `store=False` ZDR guards locally:
+Run the offline contract suite (`<1s`, zero cloud calls) to verify the `SKILL.md` `PROTECTED` compliance block, `CreateAgentInteraction` schema validation for `previous_interaction_id`, proxy header `transform` isolation, SSE `environment_id` fallback hydration, and fresh agent reuse:
 
 ```bash
 pytest test_managed_agent.py
@@ -70,7 +75,9 @@ pytest test_managed_agent.py
 
 ---
 
-## Step 3: Provision & Inspect the Custom Managed Agent (Part A)
+## Lab Step 1: Creating the Managed Agent (`client.agents.create`)
+
+Provision the persistent Managed Agent once on the control plane (`locations/global`):
 
 ```bash
 export GOOGLE_CLOUD_PROJECT="$(gcloud config get-value project)"
@@ -79,29 +86,89 @@ export CATALOG_MCP_URL="$(gcloud run services describe knowledge-catalog-mcp --r
 python create_managed_agent.py
 ```
 
-Copy the printed `export MANAGED_AGENT_ID="..."` line into your shell.
+Copy the printed `export MANAGED_AGENT_ID="..."` line into your shell. Under the hood, [`create_managed_agent.py`](create_managed_agent.py) registers:
+- `base_agent="antigravity-preview-05-2026"` (with optional `agent_config` overrides via `MANAGED_AGENT_MODEL` / `MANAGED_AGENT_MAX_TOKENS`)
+- `tools`: `[{"type": "code_execution"}, {"type": "mcp_server", "name": "knowledge-catalog-mcp", "url": CATALOG_MCP_URL}]`
+- `base_environment`: mounts [`skills/tokenomics-analytics/SKILL.md`](skills/tokenomics-analytics/SKILL.md) (`skill_registry`, `gcs`, or `inline`) and restricts outbound egress to `bigquery.googleapis.com` and your Cloud Run MCP host.
 
 > [!NOTE]
-> **Updating an Existing Managed Agent:** `client.agents.update()` is not yet exposed in the Python SDK; to mutate an existing agent ID in place without recreating it, send a REST `PATCH https://aiplatform.googleapis.com/v1beta1/projects/${GOOGLE_CLOUD_PROJECT}/locations/global/agents/${MANAGED_AGENT_ID}?updateMask=systemInstruction,tools,baseEnvironment`.
+> **Updating an Existing Managed Agent:** `client.agents.update()` is not yet exposed in the Python SDK; to update an existing agent ID in place without recreating it, send a REST `PATCH https://aiplatform.googleapis.com/v1beta1/projects/${GOOGLE_CLOUD_PROJECT}/locations/global/agents/${MANAGED_AGENT_ID}?updateMask=systemInstruction,tools,baseEnvironment`.
 
 ---
 
-## Step 4: Execute Multi-Turn Self-Built BigQuery Tool Verification (Part A)
+## Lab Steps 2–4: Interactions API, Follow-Up Chaining & Agent Reuse
+
+Run the live verification script to execute **Steps 1 through 4** end-to-end against your `MANAGED_AGENT_ID`:
 
 ```bash
 python test_managed_agent.py
 ```
 
-This runs three live turns against your Managed Agent using the exact Qwiklabs dataset from Labs 1–2:
-1. **Turn 1 (Zero-Scan Metric Lookup):** Resolves the official `bounce_rate` SQL formula via `knowledge-catalog-mcp` with **zero BigQuery scans** and captures `environment_id`.
-2. **Turn 2 (Build & Self-Test `bq_runner.py` in Persistent Sandbox):** Reattaches to `t1.environment_id`, fetches `ga_sessions` `_TABLE_SUFFIX` partition rules from the catalog, writes `/tmp/bq_runner.py` (mirrored to `./bq_runner.py`) in Python stdlib `urllib.request`, runs local unit assertions blocking `SELECT *` and unpartitioned queries, and inspects the remote workspace snapshot via `client.environments.files.list()`.
-3. **Turn 3 (Pure `code_execution` BigQuery Run — Zero MCP Attached):** Overrides `tools=[{"type": "code_execution"}]` (detaching all MCP servers) and attaches short-lived proxy header injection (`network.allowlist[].transform`) for `bigquery.googleapis.com`. The agent runs `/tmp/bq_runner.py` from its persistent sandbox, verifies `dryRun` bytes (`<= 100 MB`), queries `bigquery-public-data.google_analytics_sample.ga_sessions_*` (`_TABLE_SUFFIX = '20170801'`), and reports exact visit counts and dry-run bytes.
+Here is what [`test_managed_agent.py`](test_managed_agent.py) and [`low_infra_harness.py`](low_infra_harness.py) execute at each step:
+
+### Lab Step 2 — Using the Agent with the Interactions API (Initial Turn)
+
+Starts **Session A** against `agent=MANAGED_AGENT_ID` with no prior state handles. The agent queries `knowledge-catalog-mcp` for the official `bounce_rate` SQL formula and `ga_sessions` `_TABLE_SUFFIX` partition rule (**zero BigQuery scan**) and returns both `t1.interaction_id` and `t1.environment_id`:
+
+```python
+t1 = run_managed_interaction(
+    client,
+    agent=agent_id,
+    prompt=(
+        "Look up our official business formula for bounce rate and the required partition "
+        "key for ga_sessions in the Knowledge Catalog without running any BigQuery SQL."
+    ),
+    environment=build_bigquery_proxy_environment(project_id, catalog_mcp_url=catalog_mcp_url),
+)
+# Returns: t1.interaction_id (conversation turn ID) + t1.environment_id (7-day sandbox ID)
+```
+
+### Lab Step 3 — Following Up on the Previous Interaction (`previous_interaction_id` + `environment_id`)
+
+Continues **Session A** by passing **both** `previous_interaction_id` (preserving prior conversation context and `thought` steps) and `environment_id` (preserving the Linux sandbox filesystem):
+
+1. **Follow-Up 3a (`previous_interaction_id=t1.interaction_id`, `environment_id=t1.environment_id`):** References the `ga_sessions` partition rule from Step 2 without repeating it, builds `/tmp/bq_runner.py` (mirrored to `./bq_runner.py`) inside `code_execution`, unit-tests its local `SELECT *` and `_TABLE_SUFFIX` guards, and snapshots the workspace via `client.environments.files.list()`.
+2. **Follow-Up 3b (`previous_interaction_id=t2.interaction_id`, `environment_id=t1.environment_id`, `tools=[{"type": "code_execution"}]`):** Detaches all MCP servers and injects a short-lived BigQuery OAuth header at the **host egress proxy** (`network.allowlist[].transform`) so zero credentials ever enter sandbox memory or env vars. The agent executes `/tmp/bq_runner.py` from Step 3a, enforces `dryRun <= 100 MB`, and queries `ga_sessions_20170801` for the top 3 traffic sources:
+
+```python
+t3 = run_managed_interaction(
+    client,
+    agent=agent_id,
+    previous_interaction_id=t2.interaction_id,  # Chains Session A conversation history
+    prompt="Now run ONLY your /tmp/bq_runner.py CLI for August 1, 2017 (`_TABLE_SUFFIX = '20170801'`).",
+    environment=build_bigquery_proxy_environment(
+        project_id,
+        bq_access_token=mint_bigquery_access_token(),
+        environment_id=t1.environment_id,       # Reattaches Session A sandbox disk
+    ),
+    tools=[{"type": "code_execution"}],         # Zero MCP attached on this turn
+)
+```
+
+### Lab Step 4 — Reusing the Same Agent for the Next Independent Interaction (Fresh Session)
+
+Invokes the **same `MANAGED_AGENT_ID`** while omitting both `previous_interaction_id` and `environment_id`. Without re-creating the agent or re-uploading `SKILL.md`, **Session B** starts with clean conversation memory and a brand-new isolated sandbox (`t4.environment_id != t1.environment_id`, with no leftover `/tmp/bq_runner.py` from Session A):
+
+```python
+t4 = run_managed_interaction(
+    client,
+    agent=agent_id,  # Same control-plane Managed Agent ID — no previous_interaction_id or environment_id
+    prompt=(
+        "What is our official Knowledge Catalog definition and SQL formula for Monthly Active "
+        "Users (monthly-active-users)? Also check via code_execution whether /tmp/bq_runner.py "
+        "exists in this fresh sandbox."
+    ),
+    environment=build_bigquery_proxy_environment(project_id, catalog_mcp_url=catalog_mcp_url),
+)
+assert t4.previous_interaction_id is None
+assert t4.environment_id != t1.environment_id
+```
 
 ---
 
-## Step 5: Run Thin Stateful `/interactions` vs. ZDR Model Harness (Part B)
+## Lab Step 5: Thin Model-Only `/interactions` Harness vs. ZDR Mode (Part B)
 
-Compare multi-turn `previous_interaction_id` prefix-cache & `thought` lineage against `store=False` Zero Data Retention directly on `gemini-3.8-flash` (with zero agent framework or container):
+Compare multi-turn `previous_interaction_id` prefix-cache & `thought` chaining against `store=False` stateless Zero Data Retention directly on `gemini-3.8-flash` (with zero agent container or sandbox):
 
 ```bash
 python low_infra_harness.py
@@ -109,9 +176,9 @@ python low_infra_harness.py
 
 ---
 
-## Step 6: Clean Up
+## Lab Step 6: Clean Up
 
-Managed Agent definitions and `7-day` remote sandboxes can be deleted explicitly when finished:
+Managed Agent definitions and `7-day` remote sandboxes can be deleted explicitly when finished (or automatically by passing `--cleanup` to `python test_managed_agent.py --cleanup`):
 
 ```bash
 python cleanup_managed_agent.py --agent-id "$MANAGED_AGENT_ID"

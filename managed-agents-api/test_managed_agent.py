@@ -226,6 +226,102 @@ def test_run_managed_interaction_raises_on_error_event_or_failed_status() -> Non
         run_managed_interaction(fake_client, agent="demo-agent-01", prompt="Run query.")
 
 
+def test_run_managed_interaction_chains_previous_interaction_id_and_blocks_zdr() -> None:
+    from google.genai._gaos.types.interactions import CreateAgentInteraction
+
+    captured_calls: list[dict[str, object]] = []
+
+    def fake_create(**kwargs: object):
+        # Validate payload against the official google-genai CreateAgentInteraction schema
+        CreateAgentInteraction.model_validate(kwargs)
+        captured_calls.append(dict(kwargs))
+        return iter(
+            [
+                types.SimpleNamespace(
+                    event_type="interaction.completed",
+                    interaction=types.SimpleNamespace(
+                        id="int_followup_2",
+                        previous_interaction_id=kwargs.get("previous_interaction_id"),
+                        environment_id="env_persist_001",
+                        status="completed",
+                        usage=None,
+                    ),
+                )
+            ]
+        )
+
+    fake_client = types.SimpleNamespace(
+        interactions=types.SimpleNamespace(create=fake_create)
+    )
+
+    with pytest.raises(ValueError, match="store=True"):
+        run_managed_interaction(
+            fake_client,
+            agent="demo-agent-01",
+            prompt="Follow up in ZDR mode",
+            previous_interaction_id="int_1",
+            store=False,
+        )
+
+    followup = run_managed_interaction(
+        fake_client,
+        agent="demo-agent-01",
+        prompt="Using the partition rule from our previous turn, build /tmp/bq_runner.py.",
+        previous_interaction_id="int_1",
+        environment={"type": "remote", "environment_id": "env_persist_001"},
+    )
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["agent"] == "demo-agent-01"
+    assert captured_calls[0]["previous_interaction_id"] == "int_1"
+    assert followup.interaction_id == "int_followup_2"
+    assert followup.previous_interaction_id == "int_1"
+    assert followup.environment_id == "env_persist_001"
+
+
+def test_reusing_same_agent_starts_fresh_isolated_interaction_when_ids_omitted() -> None:
+    captured_calls: list[dict[str, object]] = []
+
+    def fake_create(**kwargs: object):
+        call_num = len(captured_calls) + 1
+        captured_calls.append(dict(kwargs))
+        return iter(
+            [
+                types.SimpleNamespace(
+                    event_type="interaction.completed",
+                    interaction=types.SimpleNamespace(
+                        id=f"int_session_{call_num}",
+                        previous_interaction_id=kwargs.get("previous_interaction_id"),
+                        environment_id=f"env_session_{call_num}",
+                        status="completed",
+                        usage=None,
+                    ),
+                )
+            ]
+        )
+
+    fake_client = types.SimpleNamespace(
+        interactions=types.SimpleNamespace(create=fake_create)
+    )
+
+    session_a = run_managed_interaction(
+        fake_client,
+        agent="demo-agent-01",
+        prompt="Session A: bounce rate formula?",
+    )
+    session_b = run_managed_interaction(
+        fake_client,
+        agent="demo-agent-01",
+        prompt="Session B: monthly active users formula?",
+    )
+
+    assert captured_calls[0]["agent"] == captured_calls[1]["agent"] == "demo-agent-01"
+    assert "previous_interaction_id" not in captured_calls[1]
+    assert "environment" not in captured_calls[1]
+    assert session_b.previous_interaction_id is None
+    assert session_a.interaction_id != session_b.interaction_id
+    assert session_a.environment_id != session_b.environment_id
+
+
 def test_inspect_sandbox_environment_returns_snapshot_files() -> None:
     fake_client = types.SimpleNamespace(
         environments=types.SimpleNamespace(
@@ -301,8 +397,9 @@ def run_live_verification(cleanup: bool = False) -> None:
     client = genai.Client(enterprise=True, project=project_id, location="global")
     agent_id = os.getenv("MANAGED_AGENT_ID")
     created_ephemeral = False
-    active_env_id: str | None = None
+    created_envs: list[str] = []
 
+    print("\n=== [Step 1/4] Create or Load Managed Agent (client.agents.create) ===")
     if not agent_id:
         agent_id = f"tokenomics-analytics-{uuid.uuid4().hex[:8]}"
         spec = build_agent_spec(
@@ -318,80 +415,148 @@ def run_live_verification(cleanup: bool = False) -> None:
         client.agents.create(**spec)
         wait_for_agent_ready(client, agent_id)
         created_ephemeral = True
+    else:
+        details = wait_for_agent_ready(client, agent_id)
+        print(f"Using pre-created Managed Agent '{details.id}' (base_agent={details.base_agent}).")
 
     try:
-        print("\n=== Turn 1: Metric Formula via Knowledge Catalog MCP (Zero BQ Scan) ===")
+        print(
+            "\n=== [Step 2/4] First Interaction via Interactions API "
+            "(Session A — Initial Turn, Zero BQ Scan) ==="
+        )
         t1 = run_managed_interaction(
             client,
             agent=agent_id,
-            prompt="What is our official business formula for bounce rate?",
+            prompt=(
+                "Look up our official business formula for bounce rate and the required partition "
+                "key for ga_sessions in the Knowledge Catalog without running any BigQuery SQL."
+            ),
             environment=build_bigquery_proxy_environment(
                 project_id,
                 catalog_mcp_url=catalog_mcp_url,
             ),
         )
-        active_env_id = t1.environment_id
+        session_a_env_id = t1.environment_id
+        if session_a_env_id:
+            created_envs.append(session_a_env_id)
         print(t1.output_text)
-        print(f"[State] interaction_id={t1.interaction_id} | environment_id={t1.environment_id}")
+        print(
+            f"[Session A — Turn 1] interaction_id={t1.interaction_id} | "
+            f"environment_id={session_a_env_id}"
+        )
         assert "bounces" in t1.output_text.lower() or "countif" in t1.output_text.lower()
+        assert "_table_suffix" in t1.output_text.lower()
 
-        print("\n=== Turn 2: Build & Unit-Test `/tmp/bq_runner.py` Inside Persistent Sandbox ===")
+        print(
+            "\n=== [Step 3/4] Follow Up on Previous Interaction "
+            "(Session A — Chained via previous_interaction_id + environment_id) ==="
+        )
+        print("--- [Step 3a] Build & Self-Test `/tmp/bq_runner.py` in Same Conversation & Sandbox ---")
         t2 = run_managed_interaction(
             client,
             agent=agent_id,
+            previous_interaction_id=t1.interaction_id,
             prompt=(
-                "1. Look up the partition rules for ga_sessions in the Knowledge Catalog without running SQL.\n"
-                "2. In code_execution, write /tmp/bq_runner.py (and copy it to ./bq_runner.py in the workspace) "
-                "following the tokenomics-analytics skill (rejecting SELECT *, requiring _TABLE_SUFFIX on ga_sessions, "
-                "running dryRun<=100MB first, and calling https://bigquery.googleapis.com/bigquery/v2/projects/${GOOGLE_CLOUD_PROJECT}/queries "
-                "using Python stdlib urllib with no Authorization header in code).\n"
-                "3. Run a local self-test in Python confirming /tmp/bq_runner.py rejects 'SELECT * FROM ga_sessions_*' "
-                "and rejects queries missing _TABLE_SUFFIX before making any HTTP request."
+                "Using the ga_sessions partition rule from our previous turn, write /tmp/bq_runner.py "
+                "(and copy it to ./bq_runner.py in the workspace) in code_execution following the "
+                "tokenomics-analytics skill (rejecting SELECT *, requiring _TABLE_SUFFIX on ga_sessions, "
+                "running dryRun<=100MB first, and calling "
+                "https://bigquery.googleapis.com/bigquery/v2/projects/${GOOGLE_CLOUD_PROJECT}/queries "
+                "using Python stdlib urllib with no Authorization header in code). "
+                "Then run a local self-test in Python confirming /tmp/bq_runner.py rejects "
+                "'SELECT * FROM ga_sessions_*' and queries missing _TABLE_SUFFIX before any HTTP call."
             ),
             environment=build_bigquery_proxy_environment(
                 project_id,
                 catalog_mcp_url=catalog_mcp_url,
-                environment_id=t1.environment_id,
+                environment_id=session_a_env_id,
             ),
         )
-        active_env_id = t2.environment_id or active_env_id
+        session_a_env_id = t2.environment_id or session_a_env_id
+        if session_a_env_id and session_a_env_id not in created_envs:
+            created_envs.append(session_a_env_id)
         print(t2.output_text)
+        print(
+            f"[Session A — Turn 2] interaction_id={t2.interaction_id} "
+            f"(prev={t2.previous_interaction_id}) | environment_id={session_a_env_id}"
+        )
         assert "_TABLE_SUFFIX" in t2.output_text
         assert "code_execution_call" in t2.tool_calls
 
-        if active_env_id:
-            snap = inspect_sandbox_environment(client, active_env_id)
-            print(f"[Sandbox Snapshot] env={snap['id']} status={snap['status']} files={snap['files']}")
+        if session_a_env_id:
+            snap = inspect_sandbox_environment(client, session_a_env_id)
+            print(
+                f"[Sandbox Snapshot] env={snap['id']} status={snap['status']} files={snap['files']}"
+            )
 
-        print("\n=== Turn 3: Execute Self-Built BigQuery CLI in Sandbox (Zero MCP Attached!) ===")
+        print("--- [Step 3b] Follow-Up Query Execution Using Self-Built CLI (Zero MCP Attached!) ---")
         bq_token = mint_bigquery_access_token()
         t3 = run_managed_interaction(
             client,
             agent=agent_id,
+            previous_interaction_id=t2.interaction_id,
             prompt=(
-                "Using ONLY your /tmp/bq_runner.py CLI in code_execution (no MCP tools), "
-                "find the top 3 traffic sources (trafficSource.source) by visit count in "
+                "Now run ONLY your /tmp/bq_runner.py CLI in code_execution (no MCP tools) to find "
+                "the top 3 traffic sources (trafficSource.source) by visit count in "
                 "`bigquery-public-data.google_analytics_sample.ga_sessions_*` for August 1, 2017 "
-                "(`_TABLE_SUFFIX = '20170801'`), and report both the dry-run bytes processed and the exact counts."
+                "(`_TABLE_SUFFIX = '20170801'`), and report both the dry-run bytes processed and exact counts."
             ),
             environment=build_bigquery_proxy_environment(
                 project_id,
                 bq_access_token=bq_token,
-                environment_id=active_env_id,
+                environment_id=session_a_env_id,
             ),
             tools=[{"type": "code_execution"}],
         )
         print(t3.output_text)
+        print(
+            f"[Session A — Turn 3] interaction_id={t3.interaction_id} "
+            f"(prev={t3.previous_interaction_id}) | environment_id={t3.environment_id}"
+        )
         assert "code_execution_call" in t3.tool_calls
         assert "mcp_server_tool_call" not in t3.tool_calls
-        print("\nALL MANAGED AGENTS API SELF-BUILT BQ TOOL & GOVERNANCE CHECKS PASSED!")
+
+        print(
+            "\n=== [Step 4/4] Reuse Same Agent for Next Independent Interaction "
+            "(Session B — Fresh Conversation & Clean Isolated Sandbox) ==="
+        )
+        t4 = run_managed_interaction(
+            client,
+            agent=agent_id,
+            prompt=(
+                "What is our official Knowledge Catalog definition and SQL formula for Monthly Active "
+                "Users (monthly-active-users)? Also check via code_execution whether /tmp/bq_runner.py "
+                "exists in this fresh sandbox."
+            ),
+            environment=build_bigquery_proxy_environment(
+                project_id,
+                catalog_mcp_url=catalog_mcp_url,
+            ),
+        )
+        if t4.environment_id and t4.environment_id not in created_envs:
+            created_envs.append(t4.environment_id)
+        print(t4.output_text)
+        print(
+            f"[Session B — Fresh Turn 1] interaction_id={t4.interaction_id} "
+            f"(prev={t4.previous_interaction_id}) | environment_id={t4.environment_id}"
+        )
+        assert t4.previous_interaction_id is None
+        assert "fullvisitorid" in t4.output_text.lower()
+        if session_a_env_id and t4.environment_id:
+            assert t4.environment_id != session_a_env_id
+
+        print("\nALL 4 MANAGED AGENT LIFECYCLE STEPS & GOVERNANCE CHECKS PASSED!")
     finally:
         if cleanup or created_ephemeral:
             client.agents.delete(id=agent_id)
             print(f"Cleaned up Managed Agent: {agent_id}")
-            if cleanup and active_env_id:
-                client.environments.delete(id=active_env_id)
-                print(f"Cleaned up Remote Environment: {active_env_id}")
+            if cleanup:
+                for env_id in created_envs:
+                    try:
+                        client.environments.delete(id=env_id)
+                        print(f"Cleaned up Remote Environment: {env_id}")
+                    except Exception:  # noqa: BLE001, S110
+                        pass
 
 
 if __name__ == "__main__":

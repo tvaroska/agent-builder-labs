@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 @dataclass
 class ManagedTurnResult:
     interaction_id: str | None = None
+    previous_interaction_id: str | None = None
     environment_id: str | None = None
     status: str | None = None
     output_text: str = ""
@@ -51,6 +52,8 @@ class ManagedTurnResult:
 def _hydrate_from_interaction(result: ManagedTurnResult, interaction: Any) -> None:
     if getattr(interaction, "id", None):
         result.interaction_id = interaction.id
+    if getattr(interaction, "previous_interaction_id", None):
+        result.previous_interaction_id = interaction.previous_interaction_id
     if getattr(interaction, "environment_id", None):
         result.environment_id = interaction.environment_id
     if getattr(interaction, "status", None):
@@ -158,6 +161,7 @@ def run_managed_interaction(
     *,
     agent: str,
     prompt: str,
+    previous_interaction_id: str | None = None,
     environment: str | dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
     store: bool = True,
@@ -166,10 +170,19 @@ def run_managed_interaction(
 ) -> ManagedTurnResult:
     """Streams a single turn against a Managed Agent and extracts state handles.
 
-    Agent interactions are backed by a durable server-side task; passing the
-    returned `environment_id` into subsequent turns reattaches to the same
-    7-day rolling TTL Linux sandbox (preserving agent-built scripts and files).
+    Supports all three state patterns on a reusable Managed Agent (`agent`):
+    1. First interaction: omit `previous_interaction_id` and `environment_id` to
+       start a new conversation and provision a fresh 7-day Linux sandbox.
+    2. Session follow-up: pass `previous_interaction_id` (chaining conversation
+       `steps[]` & `thought` context) together with `environment_id` (reattaching
+       to the persistent Linux sandbox where agent-built scripts reside).
+    3. Fresh agent reuse: call the same `agent` ID again without
+       `previous_interaction_id` or `environment_id` to serve a new user or task
+       in a clean, isolated sandbox.
     """
+    if not store and previous_interaction_id is not None:
+        raise ValueError("previous_interaction_id requires store=True.")
+
     kwargs: dict[str, Any] = {
         "agent": agent,
         "input": prompt,
@@ -177,12 +190,14 @@ def run_managed_interaction(
         "background": background,
         "store": store,
     }
+    if previous_interaction_id is not None:
+        kwargs["previous_interaction_id"] = previous_interaction_id
     if environment is not None:
         kwargs["environment"] = environment
     if tools is not None:
         kwargs["tools"] = tools
 
-    result = ManagedTurnResult()
+    result = ManagedTurnResult(previous_interaction_id=previous_interaction_id)
     chunks: list[str] = []
 
     stream = client.interactions.create(**kwargs)
