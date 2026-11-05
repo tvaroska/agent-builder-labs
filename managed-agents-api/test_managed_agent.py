@@ -15,8 +15,6 @@ import types
 import uuid
 
 import pytest
-from dotenv import load_dotenv
-
 from create_managed_agent import (
     DEFAULT_BASE_AGENT,
     SKILL_FILE,
@@ -25,24 +23,28 @@ from create_managed_agent import (
     build_skill_source,
     wait_for_agent_ready,
 )
+from dotenv import load_dotenv
 from low_infra_harness import (
     build_bigquery_proxy_environment,
+    inspect_sandbox_environment,
     mint_bigquery_access_token,
     run_managed_interaction,
     run_thin_model_turn,
 )
-
 
 # ---------------------------------------------------------------------------
 # Hermetic Unit & Contract Tests (`pytest test_managed_agent.py`)
 # ---------------------------------------------------------------------------
 
 
-def test_skill_markdown_has_frontmatter_circuit_breaker_and_self_built_bq_cli() -> None:
+def test_skill_markdown_has_frontmatter_protected_block_and_self_built_bq_cli() -> None:
     text = SKILL_FILE.read_text(encoding="utf-8")
     assert text.startswith("---\nname: tokenomics-analytics\n")
+    assert "<!-- PROTECTED:START -->" in text
+    assert "<!-- PROTECTED:END -->" in text
     assert "knowledge-catalog-mcp" in text
     assert "/tmp/bq_runner.py" in text
+    assert "./bq_runner.py" in text
     assert "dryRun" in text
     assert "_TABLE_SUFFIX" in text
     assert "SELECT" in text
@@ -69,15 +71,22 @@ def test_build_skill_source_modes() -> None:
     assert "tokenomics-analytics" in inline["content"]
 
 
-def test_build_agent_spec_wires_mcp_and_least_privilege_allowlist() -> None:
+def test_build_agent_spec_wires_mcp_allowlist_and_optional_agent_config() -> None:
     mcp_url = "https://knowledge-catalog-mcp-abc123-uc.a.run.app/sse"
     spec = build_agent_spec(
         agent_id="demo-agent-01",
         project_id="sample-analytics-proj",
         catalog_mcp_url=mcp_url,
+        model="gemini-3.8-flash",
+        max_total_tokens=65536,
     )
     assert spec["id"] == "demo-agent-01"
     assert spec["base_agent"] == DEFAULT_BASE_AGENT
+    assert spec["agent_config"] == {
+        "type": "antigravity",
+        "model": "gemini-3.8-flash",
+        "max_total_tokens": 65536,
+    }
     assert {"type": "code_execution"} in spec["tools"]
     assert {
         "type": "mcp_server",
@@ -119,12 +128,13 @@ def test_build_bigquery_proxy_environment_injects_headers_outside_sandbox() -> N
     assert {"domain": "knowledge-catalog-mcp-xyz-uc.a.run.app"} in allowlist
 
 
-def test_run_managed_interaction_collects_text_code_execution_and_env_id() -> None:
+def test_run_managed_interaction_hydrates_env_id_via_get_fallback() -> None:
+    # Simulate SSE stream where InteractionSseEventInteraction omits environment_id
     events = [
         types.SimpleNamespace(
             event_type="interaction.created",
             interaction=types.SimpleNamespace(
-                id="int_1", environment_id=None, status="in_progress", usage=None
+                id="int_1", status="in_progress", usage=None
             ),
         ),
         types.SimpleNamespace(
@@ -143,9 +153,10 @@ def test_run_managed_interaction_collects_text_code_execution_and_env_id() -> No
             event_type="interaction.completed",
             interaction=types.SimpleNamespace(
                 id="int_1",
-                environment_id="env_persist_001",
                 status="completed",
                 usage=types.SimpleNamespace(
+                    total_input_tokens=4000,
+                    total_output_tokens=200,
                     total_tokens=4200,
                     total_cached_tokens=3600,
                     total_thought_tokens=310,
@@ -155,13 +166,23 @@ def test_run_managed_interaction_collects_text_code_execution_and_env_id() -> No
     ]
 
     recorded_kwargs: dict[str, object] = {}
+    fetched_ids: list[str] = []
 
     def fake_create(**kwargs: object):
         recorded_kwargs.update(kwargs)
         return iter(events)
 
+    def fake_get(interaction_id: str):
+        fetched_ids.append(interaction_id)
+        return types.SimpleNamespace(
+            id=interaction_id,
+            environment_id="env_persist_001",
+            status="completed",
+            usage=None,
+        )
+
     fake_client = types.SimpleNamespace(
-        interactions=types.SimpleNamespace(create=fake_create)
+        interactions=types.SimpleNamespace(create=fake_create, get=fake_get)
     )
 
     turn = run_managed_interaction(
@@ -174,12 +195,60 @@ def test_run_managed_interaction_collects_text_code_execution_and_env_id() -> No
 
     assert recorded_kwargs["agent"] == "demo-agent-01"
     assert recorded_kwargs["tools"] == [{"type": "code_execution"}]
+    assert fetched_ids == ["int_1"]
     assert turn.interaction_id == "int_1"
     assert turn.environment_id == "env_persist_001"
     assert turn.status == "completed"
     assert turn.tool_calls == ["code_execution_call"]
     assert turn.output_text == "Top source: (direct) with 1,240 sessions."
     assert turn.cached_tokens == 3600
+    assert turn.cache_hit_ratio == pytest.approx(0.90)
+
+
+def test_run_managed_interaction_raises_on_error_event_or_failed_status() -> None:
+    error_events = [
+        types.SimpleNamespace(
+            event_type="interaction.created",
+            interaction=types.SimpleNamespace(
+                id="int_err", environment_id="env_1", status="in_progress", usage=None
+            ),
+        ),
+        types.SimpleNamespace(
+            event_type="error",
+            error="Sandbox quota exhausted",
+        ),
+    ]
+    fake_client = types.SimpleNamespace(
+        interactions=types.SimpleNamespace(create=lambda **_kw: iter(error_events))
+    )
+
+    with pytest.raises(RuntimeError, match="Sandbox quota exhausted"):
+        run_managed_interaction(fake_client, agent="demo-agent-01", prompt="Run query.")
+
+
+def test_inspect_sandbox_environment_returns_snapshot_files() -> None:
+    fake_client = types.SimpleNamespace(
+        environments=types.SimpleNamespace(
+            get=lambda *, id: types.SimpleNamespace(
+                id=id, status="READY", file_count=2, size_bytes=4096
+            ),
+            files=types.SimpleNamespace(
+                list=lambda *, environment, path: types.SimpleNamespace(
+                    files=[
+                        types.SimpleNamespace(path="bq_runner.py", name="bq_runner.py"),
+                        types.SimpleNamespace(
+                            path=".agents/skills/tokenomics-analytics/SKILL.md",
+                            name="SKILL.md",
+                        ),
+                    ]
+                )
+            ),
+        )
+    )
+    snap = inspect_sandbox_environment(fake_client, "env_persist_001")
+    assert snap["id"] == "env_persist_001"
+    assert snap["status"] == "READY"
+    assert "bq_runner.py" in snap["files"]
 
 
 def test_run_thin_model_turn_enforces_zdr_constraint_and_turn_scoped_args() -> None:
@@ -232,6 +301,7 @@ def run_live_verification(cleanup: bool = False) -> None:
     client = genai.Client(enterprise=True, project=project_id, location="global")
     agent_id = os.getenv("MANAGED_AGENT_ID")
     created_ephemeral = False
+    active_env_id: str | None = None
 
     if not agent_id:
         agent_id = f"tokenomics-analytics-{uuid.uuid4().hex[:8]}"
@@ -240,6 +310,7 @@ def run_live_verification(cleanup: bool = False) -> None:
             project_id=project_id,
             catalog_mcp_url=catalog_mcp_url,
             base_agent=os.getenv("MANAGED_BASE_AGENT", DEFAULT_BASE_AGENT),
+            model=os.getenv("MANAGED_AGENT_MODEL") or None,
             skill_resource_name=os.getenv("SKILL_RESOURCE_NAME") or None,
             skill_gcs_bucket=os.getenv("AGENT_SKILL_GCS_BUCKET") or None,
         )
@@ -259,6 +330,7 @@ def run_live_verification(cleanup: bool = False) -> None:
                 catalog_mcp_url=catalog_mcp_url,
             ),
         )
+        active_env_id = t1.environment_id
         print(t1.output_text)
         print(f"[State] interaction_id={t1.interaction_id} | environment_id={t1.environment_id}")
         assert "bounces" in t1.output_text.lower() or "countif" in t1.output_text.lower()
@@ -269,9 +341,9 @@ def run_live_verification(cleanup: bool = False) -> None:
             agent=agent_id,
             prompt=(
                 "1. Look up the partition rules for ga_sessions in the Knowledge Catalog without running SQL.\n"
-                "2. In code_execution, write /tmp/bq_runner.py following the tokenomics-analytics skill "
-                "(rejecting SELECT *, requiring _TABLE_SUFFIX on ga_sessions, running dryRun<=100MB first, "
-                "and calling https://bigquery.googleapis.com/bigquery/v2/projects/${GOOGLE_CLOUD_PROJECT}/queries "
+                "2. In code_execution, write /tmp/bq_runner.py (and copy it to ./bq_runner.py in the workspace) "
+                "following the tokenomics-analytics skill (rejecting SELECT *, requiring _TABLE_SUFFIX on ga_sessions, "
+                "running dryRun<=100MB first, and calling https://bigquery.googleapis.com/bigquery/v2/projects/${GOOGLE_CLOUD_PROJECT}/queries "
                 "using Python stdlib urllib with no Authorization header in code).\n"
                 "3. Run a local self-test in Python confirming /tmp/bq_runner.py rejects 'SELECT * FROM ga_sessions_*' "
                 "and rejects queries missing _TABLE_SUFFIX before making any HTTP request."
@@ -282,9 +354,14 @@ def run_live_verification(cleanup: bool = False) -> None:
                 environment_id=t1.environment_id,
             ),
         )
+        active_env_id = t2.environment_id or active_env_id
         print(t2.output_text)
         assert "_TABLE_SUFFIX" in t2.output_text
         assert "code_execution_call" in t2.tool_calls
+
+        if active_env_id:
+            snap = inspect_sandbox_environment(client, active_env_id)
+            print(f"[Sandbox Snapshot] env={snap['id']} status={snap['status']} files={snap['files']}")
 
         print("\n=== Turn 3: Execute Self-Built BigQuery CLI in Sandbox (Zero MCP Attached!) ===")
         bq_token = mint_bigquery_access_token()
@@ -300,7 +377,7 @@ def run_live_verification(cleanup: bool = False) -> None:
             environment=build_bigquery_proxy_environment(
                 project_id,
                 bq_access_token=bq_token,
-                environment_id=t2.environment_id or t1.environment_id,
+                environment_id=active_env_id,
             ),
             tools=[{"type": "code_execution"}],
         )
@@ -312,6 +389,9 @@ def run_live_verification(cleanup: bool = False) -> None:
         if cleanup or created_ephemeral:
             client.agents.delete(id=agent_id)
             print(f"Cleaned up Managed Agent: {agent_id}")
+            if cleanup and active_env_id:
+                client.environments.delete(id=active_env_id)
+                print(f"Cleaned up Remote Environment: {active_env_id}")
 
 
 if __name__ == "__main__":
@@ -319,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cleanup",
         action="store_true",
-        help="Delete MANAGED_AGENT_ID after completing live verification.",
+        help="Delete MANAGED_AGENT_ID and its sandbox environment after live verification.",
     )
     args = parser.parse_args()
     run_live_verification(cleanup=args.cleanup)

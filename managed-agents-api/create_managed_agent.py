@@ -72,19 +72,22 @@ def build_agent_spec(
     project_id: str,
     catalog_mcp_url: str,
     base_agent: str = DEFAULT_BASE_AGENT,
+    model: str | None = None,
+    max_total_tokens: int | None = None,
     skill_resource_name: str | None = None,
     skill_gcs_bucket: str | None = None,
 ) -> dict[str, Any]:
     """Constructs the declarative `client.agents.create` payload."""
     system_instruction = (
         "You are an enterprise Data Analytics Agent governed by strict Tokenomics rules. "
-        "Read and follow the mounted tokenomics-analytics skill (.agents/skills or ./skills). "
+        "Read and follow the mounted tokenomics-analytics skill (.agents/skills or ./skills), "
+        "including all immutable PROTECTED guardrails. "
         "Never run BigQuery jobs for metric formulas or schema questions—resolve those via "
         "knowledge-catalog-mcp. When live BigQuery rows are requested, build and execute "
-        "/tmp/bq_runner.py inside code_execution against https://bigquery.googleapis.com "
-        f"(billing project '{project_id}', dryRun<=100MB first, _TABLE_SUFFIX required, "
-        "no SELECT *); outbound Authorization headers are injected automatically by the "
-        "sandbox egress proxy."
+        "/tmp/bq_runner.py (and mirror it to ./bq_runner.py) inside code_execution against "
+        f"https://bigquery.googleapis.com (billing project '{project_id}', dryRun<=100MB first, "
+        "_TABLE_SUFFIX required, no SELECT *); outbound Authorization headers are injected "
+        "automatically by the sandbox egress proxy."
     )
 
     tools: list[dict[str, Any]] = [
@@ -101,7 +104,7 @@ def build_agent_spec(
         skill_gcs_bucket=skill_gcs_bucket,
     )
 
-    return {
+    spec: dict[str, Any] = {
         "id": agent_id,
         "base_agent": base_agent,
         "description": "Tokenomics-governed analytics agent that builds and runs its own sandboxed BigQuery REST tool.",
@@ -119,6 +122,16 @@ def build_agent_spec(
         },
     }
 
+    if model is not None or max_total_tokens is not None:
+        agent_config: dict[str, Any] = {"type": "antigravity"}
+        if model is not None:
+            agent_config["model"] = model
+        if max_total_tokens is not None:
+            agent_config["max_total_tokens"] = max_total_tokens
+        spec["agent_config"] = agent_config
+
+    return spec
+
 
 def wait_for_agent_ready(client: Any, agent_id: str, timeout_sec: int = 45) -> Any:
     """Polls `client.agents.get` while asynchronous agent creation completes."""
@@ -129,7 +142,7 @@ def wait_for_agent_ready(client: Any, agent_id: str, timeout_sec: int = 45) -> A
             details = client.agents.get(id=agent_id)
             if getattr(details, "id", None) == agent_id:
                 return details
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_exc = exc
         time.sleep(3)
     if last_exc is not None:
@@ -151,6 +164,9 @@ def main() -> None:
 
     base_agent = os.getenv("MANAGED_BASE_AGENT", DEFAULT_BASE_AGENT)
     agent_id = os.getenv("MANAGED_AGENT_ID") or f"tokenomics-analytics-{uuid.uuid4().hex[:8]}"
+    model = os.getenv("MANAGED_AGENT_MODEL") or None
+    max_tokens_raw = os.getenv("MANAGED_AGENT_MAX_TOKENS")
+    max_total_tokens = int(max_tokens_raw) if max_tokens_raw else None
     skill_resource_name = os.getenv("SKILL_RESOURCE_NAME") or None
     skill_gcs_bucket = os.getenv("AGENT_SKILL_GCS_BUCKET") or None
 
@@ -160,11 +176,14 @@ def main() -> None:
         project_id=project_id,
         catalog_mcp_url=catalog_mcp_url,
         base_agent=base_agent,
+        model=model,
+        max_total_tokens=max_total_tokens,
         skill_resource_name=skill_resource_name,
         skill_gcs_bucket=skill_gcs_bucket,
     )
 
-    print(f"Creating Managed Agent '{agent_id}' (base_agent={base_agent})...")
+    skill_mode = spec["base_environment"]["sources"][0]["type"]
+    print(f"Creating Managed Agent '{agent_id}' (base_agent={base_agent}, skill_source={skill_mode})...")
     op = client.agents.create(**spec)
     print(f"Create operation submitted: {getattr(op, 'name', op)}")
 
@@ -174,6 +193,7 @@ def main() -> None:
     print("\nManaged Agent Ready:")
     print(f"  ID:          {details.id}")
     print(f"  Base Agent:  {details.base_agent}")
+    print(f"  Skill Mount: {skill_mode}")
     print(f"  Tools:       {tools_summary}")
     print(f"\nExport for test runs:\n  export MANAGED_AGENT_ID=\"{agent_id}\"")
 

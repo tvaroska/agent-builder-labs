@@ -14,9 +14,10 @@ Follow this three-step sequence whenever answering analytics, metric formula, sc
   - Answer strictly from Knowledge Catalog results.
   - Do **not** run any BigQuery jobs or table scans.
 
-## 2. Self-Built Sandbox BigQuery Tool (`code_execution` — No BigQuery MCP)
+<!-- PROTECTED:START -->
+## 2. Non-Negotiable Sandbox & SQL Governance Guardrails (Immutable)
 
-When live row values or aggregations are required, build and execute `/tmp/bq_runner.py` inside the sandbox (`code_execution`) using Python's standard library (`urllib.request`, `json`, `os`, `re`, `sys`):
+When live row values or aggregations are required, build and execute `/tmp/bq_runner.py` (and mirror a copy to `./bq_runner.py` in the workspace root) inside `code_execution` using Python's standard library (`urllib.request`, `json`, `os`, `re`, `shutil`, `sys`):
 
 1. **Zero Ambient Secrets in Code:**
    - Read the billing project from `os.environ["GOOGLE_CLOUD_PROJECT"]`.
@@ -31,6 +32,7 @@ When live row values or aggregations are required, build and execute `/tmp/bq_ru
 4. **Partition-Safe Execution (`dryRun: false`):**
    - `POST` `{"query": sql, "useLegacySql": false, "maximumBytesBilled": "100000000"}` (for `bigquery-public-data.google_analytics_sample.ga_sessions_*`, filter `_TABLE_SUFFIX = '20170801'` for single-day or `_TABLE_SUFFIX BETWEEN ...` for date ranges).
    - Zip `schema.fields` names with each row's `f[].v` values and print structured JSON including `dry_run_bytes` and `rows`.
+<!-- PROTECTED:END -->
 
 ## 3. Grounded Reporting
 
