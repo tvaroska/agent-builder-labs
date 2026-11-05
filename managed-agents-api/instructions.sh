@@ -49,12 +49,10 @@ done
 gcloud beta services identity create --service=aiplatform.googleapis.com --project="${PROJECT_ID}" 2>/dev/null || true
 SA_EMAIL="service-${PROJECT_NUM}@gcp-sa-aiplatform.iam.gserviceaccount.com"
 
-for role in "roles/aiplatform.serviceAgent" "roles/storage.objectViewer"; do
-    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-        --member="serviceAccount:${SA_EMAIL}" \
-        --role="${role}" \
-        --condition=None >/dev/null 2>&1 || true
-done
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/aiplatform.serviceAgent" \
+    --condition=None >/dev/null 2>&1 || true
 
 echo "[OK] IAM roles verified for ${USER_EMAIL} and ${SA_EMAIL}."
 
@@ -66,8 +64,14 @@ if ! gcloud storage buckets describe "gs://${AGENT_SKILL_GCS_BUCKET}" --project=
         --uniform-bucket-level-access
 fi
 
-gcloud storage cp -r skills/tokenomics-analytics "gs://${AGENT_SKILL_GCS_BUCKET}/" >/dev/null
-echo "[OK] Uploaded ./skills/tokenomics-analytics/SKILL.md -> gs://${AGENT_SKILL_GCS_BUCKET}/tokenomics-analytics/SKILL.md"
+# Managed Agents control plane requires storage.buckets.get + storage.objects.{create,delete,update} on the skill bucket
+gcloud storage buckets add-iam-policy-binding "gs://${AGENT_SKILL_GCS_BUCKET}" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/storage.admin" \
+    --project="${PROJECT_ID}" >/dev/null
+
+gcloud storage cp -r skills/data-analytics "gs://${AGENT_SKILL_GCS_BUCKET}/" >/dev/null
+echo "[OK] Uploaded ./skills/data-analytics/SKILL.md -> gs://${AGENT_SKILL_GCS_BUCKET}/data-analytics/SKILL.md"
 
 echo -e "\n=== 4. Writing Local .env & Installing Python Dependencies ==="
 cat > .env <<EOF

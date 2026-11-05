@@ -1,7 +1,7 @@
 # Managed Agents API & Interactions API Lab
 
 This lab runs **100% standalone in a fresh, empty Qwiklabs Google Cloud environment**—no containers to build, no MCP servers required from other labs, and no pre-existing Skill Registry resources needed:
-- **Bundled Skill (`./skills/tokenomics-analytics/SKILL.md`):** Included directly in this directory (staged to Cloud Storage by `./instructions.sh`, or mounted `inline` automatically if `AGENT_SKILL_GCS_BUCKET` is unset). Defines canonical Google Analytics metric formulas (`bounce_rate`, `monthly_active_users`), `_TABLE_SUFFIX` partition rules, and an immutable `<!-- PROTECTED:START -->` SQL governance block.
+- **Bundled Skill (`./skills/data-analytics/SKILL.md`):** Included directly in this directory and automatically staged to Cloud Storage (`gs://<PROJECT_ID>-managed-agent-skills/data-analytics/SKILL.md`) by `./instructions.sh` and `step1_create_agent.py`. Defines canonical Google Analytics metric formulas (`bounce_rate`, `monthly_active_users`), `_TABLE_SUFFIX` partition rules, and an immutable `<!-- PROTECTED:START -->` SQL governance block.
 - **Public Dataset (`bigquery-public-data.google_analytics_sample.ga_sessions_*`):** Globally available in every Qwiklabs project out-of-the-box.
 - **Zero-Secret BigQuery Sandbox Execution:** The Managed Agent writes, self-tests, and runs `/tmp/bq_runner.py` inside `code_execution`, while outbound calls to `bigquery.googleapis.com` are authenticated at the **host egress proxy** (`network.allowlist[].transform`) so **zero OAuth tokens ever enter sandbox memory, disk, or env vars**.
 
@@ -11,7 +11,7 @@ This lab runs **100% standalone in a fresh, empty Qwiklabs Google Cloud environm
 
 | Step | Script | API Operation | State Passed In $\rightarrow$ Saved Out |
 | :--- | :--- | :--- | :--- |
-| **Step 1** | [`step1_create_agent.py`](step1_create_agent.py) | **Create Managed Agent**<br>`client.agents.create(...)` | Mounts [`skills/tokenomics-analytics/SKILL.md`](skills/tokenomics-analytics/SKILL.md) + `code_execution` $\rightarrow$ saves **`agent_id`** |
+| **Step 1** | [`step1_create_agent.py`](step1_create_agent.py) | **Create Managed Agent**<br>`client.agents.create(...)` | Mounts [`skills/data-analytics/SKILL.md`](skills/data-analytics/SKILL.md) + `code_execution` $\rightarrow$ saves **`agent_id`** |
 | **Step 2** | [`step2_first_interaction.py`](step2_first_interaction.py) | **First Interaction with Agent**<br>`client.interactions.create(agent=agent_id, ...)` | Uses `agent_id` $\rightarrow$ looks up `bounce_rate` & `_TABLE_SUFFIX` rules (zero BQ scan), builds `/tmp/bq_runner.py`, saves **`interaction_id`** + **`environment_id`** |
 | **Step 3** | [`step3_followup_interaction.py`](step3_followup_interaction.py) | **Follow Up on Previous Interaction**<br>`client.interactions.create(agent=agent_id, previous_interaction_id=..., environment={..., "environment_id": ...})` | Chains Step 2's **`previous_interaction_id`** (conversation memory) + **`environment_id`** (sandbox disk with `/tmp/bq_runner.py`) + proxy `transform` auth to query `ga_sessions_20170801` |
 | **Step 4** | [`step4_new_interaction.py`](step4_new_interaction.py) | **New Interaction with Existing Agent**<br>`client.interactions.create(agent=agent_id, ...)` | Reuses **`agent_id`** from Step 1 while **omitting** `previous_interaction_id` and `environment_id` $\rightarrow$ starts a fresh conversation and clean, isolated sandbox (`new_env_id != step2_env_id`) |
@@ -40,7 +40,7 @@ chmod +x instructions.sh
 ./instructions.sh
 ```
 
-`instructions.sh` enables `aiplatform.googleapis.com`, `bigquery.googleapis.com`, and `storage.googleapis.com`, configures student and service-agent IAM roles, uploads the bundled [`skills/tokenomics-analytics/SKILL.md`](skills/tokenomics-analytics/SKILL.md) to `gs://<PROJECT_ID>-managed-agent-skills`, writes `.env`, and installs `google-genai>=2.4.0`.
+`instructions.sh` enables `aiplatform.googleapis.com`, `bigquery.googleapis.com`, and `storage.googleapis.com`, configures student and service-agent IAM roles, uploads the bundled [`skills/data-analytics/SKILL.md`](skills/data-analytics/SKILL.md) to `gs://<PROJECT_ID>-managed-agent-skills`, writes `.env`, and installs `google-genai>=2.4.0`.
 
 *(Optional `<2s` offline verification before calling Google Cloud APIs: `pytest test_managed_agent.py`)*
 
@@ -55,8 +55,8 @@ python step1_create_agent.py
 ```
 
 **What this step does:**
-- Calls `client.agents.create(...)` with `base_agent="antigravity-preview-05-2026"`, `tools=[{"type": "code_execution"}]`, and `base_environment` mounting [`skills/tokenomics-analytics/SKILL.md`](skills/tokenomics-analytics/SKILL.md) plus a least-privilege egress allowlist (`bigquery.googleapis.com`).
-- Polls `client.agents.get(id=agent_id)` until ready and saves `agent_id` to `.lab_state.json` for Tasks 2–4.
+- Stages [`skills/data-analytics/SKILL.md`](skills/data-analytics/SKILL.md) to `gs://<PROJECT_ID>-managed-agent-skills` and calls `client.agents.create(...)` with `base_agent="antigravity-preview-05-2026"`, `tools=[{"type": "code_execution"}]`, and `base_environment` (`type="remote"`, `sources=[{"type": "gcs", ...}]`).
+- Polls the CreateAgent LRO until the `base_environment` snapshot is ready (typically ~5 minutes on first creation) and saves `agent_id` to `.lab_state.json` for Tasks 2–4.
 
 ---
 

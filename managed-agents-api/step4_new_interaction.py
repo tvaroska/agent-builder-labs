@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from low_infra_harness import (
     LAB_DIR,
     ManagedTurnResult,
-    build_bigquery_proxy_environment,
+    create_genai_client,
     load_lab_state,
     resolve_project_id,
     run_managed_interaction,
@@ -29,7 +29,6 @@ from low_infra_harness import (
 def run_step4(agent_id: str | None = None) -> ManagedTurnResult:
     """Starts a brand-new isolated interaction against the existing `agent_id`."""
     load_dotenv(LAB_DIR / ".env")
-    from google import genai
 
     project_id = resolve_project_id()
     state = load_lab_state()
@@ -42,8 +41,7 @@ def run_step4(agent_id: str | None = None) -> ManagedTurnResult:
         )
 
     session_a_env_id = state.get("session_a_environment_id")
-    catalog_mcp_url = os.getenv("CATALOG_MCP_URL") or None
-    client = genai.Client(enterprise=True, project=project_id, location="global")
+    client = create_genai_client(project_id, location="global")
 
     print("=== Step 4: New Independent Interaction on Existing Agent ===")
     print(f"  reused agent_id         = {resolved_agent_id}")
@@ -55,13 +53,9 @@ def run_step4(agent_id: str | None = None) -> ManagedTurnResult:
         agent=resolved_agent_id,
         prompt=(
             "In this brand-new session: (1) state our official SQL formula for "
-            "monthly_active_users from your mounted tokenomics-analytics skill without running "
+            "monthly_active_users from your mounted skill in ./skills/ without running "
             "BigQuery SQL, and (2) check via code_execution whether `/tmp/bq_runner.py` exists "
             "in this fresh sandbox."
-        ),
-        environment=build_bigquery_proxy_environment(
-            project_id,
-            catalog_mcp_url=catalog_mcp_url,
         ),
     )
 

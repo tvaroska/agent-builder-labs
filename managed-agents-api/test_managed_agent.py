@@ -42,7 +42,7 @@ from step4_new_interaction import run_step4
 
 def test_skill_markdown_is_self_contained_for_fresh_qwiklabs() -> None:
     text = SKILL_FILE.read_text(encoding="utf-8")
-    assert text.startswith("---\nname: tokenomics-analytics\n")
+    assert text.startswith("---\nname: data-analytics\n")
     assert "bounce_rate" in text
     assert "monthly_active_users" in text
     assert "COUNT(DISTINCT fullVisitorId)" in text
@@ -54,20 +54,28 @@ def test_skill_markdown_is_self_contained_for_fresh_qwiklabs() -> None:
     assert "_TABLE_SUFFIX" in text
 
 
-def test_build_skill_source_defaults_to_self_contained_inline_mount() -> None:
-    inline = build_skill_source()
-    assert inline["type"] == "inline"
-    assert inline["target"].endswith("SKILL.md")
-    assert "tokenomics-analytics" in inline["content"]
+def test_build_skill_source_uses_gcs_or_skill_registry_for_agent_create() -> None:
+    default_gcs = build_skill_source(project_id="qwiklabs-gcp-00-demo")
+    assert default_gcs == {
+        "type": "gcs",
+        "source": "gs://qwiklabs-gcp-00-demo-managed-agent-skills",
+        "target": "./skills",
+    }
 
-    gcs = build_skill_source(skill_gcs_bucket="qwiklabs-proj-skills")
-    assert gcs == {
+    custom_gcs = build_skill_source(
+        project_id="qwiklabs-gcp-00-demo",
+        skill_gcs_bucket="qwiklabs-proj-skills",
+    )
+    assert custom_gcs == {
         "type": "gcs",
         "source": "gs://qwiklabs-proj-skills",
         "target": "./skills",
     }
 
-    reg = build_skill_source(skill_resource_name="projects/p/locations/global/skills/s1")
+    reg = build_skill_source(
+        project_id="qwiklabs-gcp-00-demo",
+        skill_resource_name="projects/p/locations/global/skills/s1",
+    )
     assert reg == {
         "type": "skill_registry",
         "source": "projects/p/locations/global/skills/s1",
@@ -85,7 +93,7 @@ def test_build_agent_spec_works_standalone_without_mcp_and_with_optional_mcp() -
     assert standalone["base_agent"] == DEFAULT_BASE_AGENT
     assert standalone["tools"] == [{"type": "code_execution"}]
     assert standalone["base_environment"]["network"]["allowlist"] == [
-        {"domain": "bigquery.googleapis.com"}
+        {"domain": "*"}
     ]
 
     # Optional MCP mode when Lab 2 Cloud Run server is also present
@@ -107,13 +115,9 @@ def test_build_agent_spec_works_standalone_without_mcp_and_with_optional_mcp() -
         "name": "knowledge-catalog-mcp",
         "url": mcp_url,
     } in with_mcp["tools"]
-    allowed_domains = {
-        entry["domain"] for entry in with_mcp["base_environment"]["network"]["allowlist"]
-    }
-    assert allowed_domains == {
-        "bigquery.googleapis.com",
-        "knowledge-catalog-mcp-abc123-uc.a.run.app",
-    }
+    assert with_mcp["base_environment"]["network"]["allowlist"] == [
+        {"domain": "*"}
+    ]
 
 
 def test_lab_state_persistence_across_steps(tmp_path: pathlib.Path) -> None:
@@ -153,11 +157,11 @@ def test_build_bigquery_proxy_environment_injects_headers_outside_sandbox() -> N
     )
     assert env_spec["type"] == "remote"
     assert env_spec["environment_id"] == "env_persist_001"
-    assert env_spec["env"] == {"GOOGLE_CLOUD_PROJECT": "qwiklabs-gcp-01-demo"}
-    assert "stub-ephemeral-token" not in str(env_spec["env"])
+    assert "env" not in env_spec
 
     allowlist = env_spec["network"]["allowlist"]
-    bq_entry = next(r for r in allowlist if r["domain"] == "bigquery.googleapis.com")
+    bq_entry = allowlist[0]
+    assert bq_entry["domain"] == "*"
     assert bq_entry["transform"] == {
         "Authorization": "Bearer stub-ephemeral-token",
         "X-Goog-User-Project": "qwiklabs-gcp-01-demo",
@@ -364,7 +368,7 @@ def test_inspect_sandbox_environment_and_thin_model_turn() -> None:
         run_thin_model_turn(
             fake_client, prompt="x", previous_interaction_id="int_m1", store=False
         )
-    assert build_egress_allowlist(None) == [{"domain": "bigquery.googleapis.com"}]
+    assert build_egress_allowlist(None) == [{"domain": "*"}]
 
 
 # ---------------------------------------------------------------------------

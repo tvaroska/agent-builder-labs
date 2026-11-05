@@ -1,9 +1,9 @@
 ---
-name: tokenomics-analytics
-description: Self-contained Tokenomics-governed BigQuery analytics skill defining canonical Google Analytics semantic metrics, _TABLE_SUFFIX partition rules, and a zero-secret sandboxed Python BigQuery REST runner.
+name: data-analytics
+description: Self-contained BigQuery data analytics skill defining canonical Google Analytics semantic metrics, _TABLE_SUFFIX partition rules, and a zero-secret sandboxed Python BigQuery REST runner.
 ---
 
-# Tokenomics-Governed BigQuery Analytics Skill
+# Data Analytics & SQL Governance Skill
 
 Follow this workflow whenever answering metric definitions, schema questions, or live BigQuery analytics queries on `bigquery-public-data.google_analytics_sample.ga_sessions_*`.
 
@@ -27,9 +27,9 @@ For conceptual, metric formula, or partition metadata questions, answer **strict
 When live row values or aggregations are requested, build and execute `/tmp/bq_runner.py` (and copy a mirror to `./bq_runner.py` in the workspace root) inside `code_execution` using Python's standard library (`urllib.request`, `json`, `os`, `re`, `shutil`, `sys`):
 
 1. **Zero Ambient Secrets in Code:**
-   - Read the billing project from `os.environ["GOOGLE_CLOUD_PROJECT"]`.
+   - Read the billing project from `os.environ.get("GOOGLE_CLOUD_PROJECT", "qwiklabs-gcp")`.
    - Send HTTPS `POST` requests directly to `https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/queries` (`Content-Type: application/json`).
-   - Do **not** look for `gcloud`, ADC files, or OAuth tokens inside the sandbox—the host egress proxy automatically injects `Authorization` and `X-Goog-User-Project` headers on outbound requests to `bigquery.googleapis.com`.
+   - Do **not** probe `gcloud`, `/etc`, `iptables`, metadata servers, or local ports inside the sandbox—if an unauthenticated sandbox returns `HTTP 401`, catch `HTTPError` cleanly in `/tmp/bq_runner.py` without retrying or scanning the filesystem.
 2. **Local Pre-Flight SQL Guardrails (Before Any Network Call):**
    - Reject any query matching `SELECT\s+\*` (case-insensitive).
    - If the query references `ga_sessions`, reject it unless `_TABLE_SUFFIX` is present in the SQL text.

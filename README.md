@@ -1,6 +1,6 @@
 # Agent Builder Labs — Gemini Platform, ADK, MCP, A2A & Managed Agents API
 
-Hands-on lab progression demonstrating **Tokenomics-governed enterprise analytics agents** on Google Cloud's **Gemini Platform**—from semantic catalog grounding and code-first **ADK** multi-agent graphs to zero-container **Managed Agents API** and low-infrastructure **Interactions API** harnesses.
+Hands-on lab progression demonstrating **enterprise data analytics agents** on Google Cloud's **Gemini Platform**—from semantic catalog grounding and code-first **ADK** multi-agent graphs to zero-container **Managed Agents API** and low-infrastructure **Interactions API** harnesses.
 
 ---
 

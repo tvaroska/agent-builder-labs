@@ -19,6 +19,7 @@ from low_infra_harness import (
     LAB_DIR,
     ManagedTurnResult,
     build_bigquery_proxy_environment,
+    create_genai_client,
     load_lab_state,
     mint_bigquery_access_token,
     resolve_project_id,
@@ -35,7 +36,6 @@ def run_step3(
 ) -> ManagedTurnResult:
     """Follows up on Step 2's interaction and executes `/tmp/bq_runner.py` against BigQuery."""
     load_dotenv(LAB_DIR / ".env")
-    from google import genai
 
     project_id = resolve_project_id()
     state = load_lab_state()
@@ -52,7 +52,7 @@ def run_step3(
         )
 
     bq_token = mint_bigquery_access_token()
-    client = genai.Client(enterprise=True, project=project_id, location="global")
+    client = create_genai_client(project_id, location="global")
 
     print("=== Step 3: Follow Up on Previous Interaction ===")
     print(f"  agent_id                = {resolved_agent_id}")
@@ -64,11 +64,14 @@ def run_step3(
         agent=resolved_agent_id,
         previous_interaction_id=resolved_prev_id,
         prompt=(
-            "Following up on our previous turn: run ONLY your existing /tmp/bq_runner.py CLI "
-            "in code_execution to query `bigquery-public-data.google_analytics_sample.ga_sessions_*` "
-            "for August 1, 2017 (`_TABLE_SUFFIX = '20170801'`). Compute the bounce_rate (using the "
-            "formula from our previous turn) and list the top 3 `trafficSource.source` values by "
-            "visit count, reporting both `dry_run_bytes` processed and the exact numbers."
+            "Following up on our previous turn: run your existing /tmp/bq_runner.py "
+            "(or ./bq_runner.py) CLI in code_execution to validate and execute the partitioned "
+            "query on `bigquery-public-data.google_analytics_sample.ga_sessions_*` for "
+            "August 1, 2017 (`_TABLE_SUFFIX = '20170801'`), computing bounce_rate (using the "
+            "formula from our previous turn) and the top 3 `trafficSource.source` values by "
+            "visit count. If the outbound request returns HTTP 401 in the zero-credential "
+            "sandbox, do NOT probe gcloud, /etc, or network interfaces—stop immediately and "
+            "report the validated SQL query, dry-run gate status, and canonical metrics."
         ),
         environment=build_bigquery_proxy_environment(
             project_id,

@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from low_infra_harness import (
     LAB_DIR,
     ManagedTurnResult,
-    build_bigquery_proxy_environment,
+    create_genai_client,
     inspect_sandbox_environment,
     load_lab_state,
     resolve_project_id,
@@ -29,7 +29,6 @@ from low_infra_harness import (
 def run_step2(agent_id: str | None = None) -> ManagedTurnResult:
     """Executes the first interaction against `agent_id` and saves session handles."""
     load_dotenv(LAB_DIR / ".env")
-    from google import genai
 
     project_id = resolve_project_id()
     state = load_lab_state()
@@ -41,8 +40,7 @@ def run_step2(agent_id: str | None = None) -> ManagedTurnResult:
             "No Managed Agent ID found. Run 'python step1_create_agent.py' first."
         )
 
-    catalog_mcp_url = os.getenv("CATALOG_MCP_URL") or None
-    client = genai.Client(enterprise=True, project=project_id, location="global")
+    client = create_genai_client(project_id, location="global")
 
     print("=== Step 2: First Interaction with Managed Agent (`client.interactions.create`) ===")
     print(f"  agent_id = {resolved_agent_id}")
@@ -51,7 +49,7 @@ def run_step2(agent_id: str | None = None) -> ManagedTurnResult:
         client,
         agent=resolved_agent_id,
         prompt=(
-            "1. From your mounted tokenomics-analytics skill (without running BigQuery SQL), "
+            "1. From your mounted skill in ./skills/ (without running BigQuery SQL), "
             "state our official SQL formula for bounce_rate and the required partition key "
             "for bigquery-public-data.google_analytics_sample.ga_sessions_*.\n"
             "2. In code_execution, write /tmp/bq_runner.py (and copy it to ./bq_runner.py in "
@@ -61,23 +59,13 @@ def run_step2(agent_id: str | None = None) -> ManagedTurnResult:
             "using Python stdlib urllib with no Authorization header in code).\n"
             "3. Run a local Python self-test confirming /tmp/bq_runner.py blocks "
             "'SELECT * FROM ga_sessions_*' and blocks queries missing _TABLE_SUFFIX before "
-            "making any HTTP request."
-        ),
-        environment=build_bigquery_proxy_environment(
-            project_id,
-            catalog_mcp_url=catalog_mcp_url,
+            "making any HTTP request. Do NOT run any live BigQuery network query in this step—stop "
+            "immediately once the local offline self-test passes."
         ),
     )
 
     print("\n--- Agent Response ---")
     print(turn1.output_text)
-
-    if turn1.environment_id:
-        snap = inspect_sandbox_environment(client, turn1.environment_id)
-        print(
-            f"\n[Sandbox Snapshot] environment_id={snap['id']} | "
-            f"status={snap['status']} | files={snap['files']}"
-        )
 
     save_lab_state(
         {
@@ -87,6 +75,13 @@ def run_step2(agent_id: str | None = None) -> ManagedTurnResult:
         },
         env_id=turn1.environment_id,
     )
+
+    if turn1.environment_id:
+        snap = inspect_sandbox_environment(client, turn1.environment_id)
+        print(
+            f"\n[Sandbox Snapshot] environment_id={snap['id']} | "
+            f"status={snap['status']} | files={snap['files']}"
+        )
 
     print("\n[OK] Step 2 Complete — Saved Session A Handles:")
     print(f"  interaction_id = {turn1.interaction_id}")

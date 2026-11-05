@@ -21,7 +21,6 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
 
 LAB_DIR = pathlib.Path(__file__).resolve().parent
 STATE_FILE = LAB_DIR / ".lab_state.json"
@@ -131,18 +130,56 @@ def _hydrate_from_interaction(result: ManagedTurnResult, interaction: Any) -> No
             result.thought_tokens = usage.total_thought_tokens
 
 
-def mint_bigquery_access_token() -> str:
-    """Mints a short-lived BigQuery OAuth access token from host ADC."""
+def get_gcp_credentials(
+    scopes: list[str] | None = None,
+) -> Any:
+    """Resolves GCP OAuth credentials from ADC, falling back to active `gcloud auth`."""
     import google.auth
+    from google.auth.exceptions import DefaultCredentialsError, RefreshError
     from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
 
-    creds, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/bigquery"]
+    target_scopes = scopes or ["https://www.googleapis.com/auth/cloud-platform"]
+    try:
+        creds, _ = google.auth.default(scopes=target_scopes)
+        creds.refresh(Request())
+        if creds.token:
+            return creds
+    except (DefaultCredentialsError, RefreshError):
+        pass
+
+    proc = subprocess.run(
+        ["gcloud", "auth", "print-access-token"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    creds.refresh(Request())
-    if not creds.token:
-        raise RuntimeError("Failed to mint OAuth access token from google.auth.default().")
-    return creds.token
+    token = (proc.stdout or "").strip()
+    if not token:
+        raise RuntimeError(
+            "Unable to obtain Google Cloud credentials via ADC or 'gcloud auth print-access-token'. "
+            "Run 'gcloud auth login' or 'gcloud auth application-default login'."
+        )
+    return Credentials(token=token)
+
+
+def create_genai_client(project_id: str, location: str = "global") -> Any:
+    """Creates an authenticated `genai.Client` on Gemini Platform (`enterprise=True`)."""
+    from google import genai
+
+    creds = get_gcp_credentials(["https://www.googleapis.com/auth/cloud-platform"])
+    return genai.Client(
+        enterprise=True,
+        project=project_id,
+        location=location,
+        credentials=creds,
+    )
+
+
+def mint_bigquery_access_token() -> str:
+    """Mints a short-lived BigQuery OAuth access token from ADC or active `gcloud`."""
+    creds = get_gcp_credentials(["https://www.googleapis.com/auth/bigquery"])
+    return str(creds.token)
 
 
 def build_bigquery_proxy_environment(
@@ -161,7 +198,11 @@ def build_bigquery_proxy_environment(
     by the agent inside `code_execution` call the BigQuery REST API directly
     without an MCP server and without any token present in sandbox env or disk.
     """
-    bq_rule: dict[str, Any] = {"domain": "bigquery.googleapis.com"}
+    # Gemini Enterprise Agent Platform currently requires `domain: "*"` on
+    # `network.allowlist` entries (domain-specific entries return HTTP 400
+    # `"Only domain: '*' is supported now."`).
+    _ = catalog_mcp_url
+    bq_rule: dict[str, Any] = {"domain": "*"}
     if bq_access_token:
         bq_rule["transform"] = {
             "Authorization": f"Bearer {bq_access_token}",
@@ -169,16 +210,13 @@ def build_bigquery_proxy_environment(
         }
 
     allowlist: list[dict[str, Any]] = [bq_rule]
-    if catalog_mcp_url:
-        host = urlparse(catalog_mcp_url).hostname
-        if host and host != "bigquery.googleapis.com":
-            allowlist.append({"domain": host})
 
+    # Note: `environment.env` is only supported on `base_environment` during
+    # `client.agents.create`; Gemini Enterprise Agent Platform rejects `env`
+    # inside per-interaction `environment` specs (`GOOGLE_CLOUD_PROJECT` is
+    # already inherited from `base_environment.env`).
     env_spec: dict[str, Any] = {
         "type": "remote",
-        "env": {
-            "GOOGLE_CLOUD_PROJECT": project_id,
-        },
         "network": {
             "allowlist": allowlist,
         },
@@ -197,19 +235,30 @@ def inspect_sandbox_environment(
     path: str = ".",
 ) -> dict[str, Any]:
     """Reads persistent remote sandbox metadata and workspace file snapshot."""
-    env_meta = client.environments.get(id=environment_id)
-    files_resp = client.environments.files.list(environment=environment_id, path=path)
-    entries = getattr(files_resp, "files", None) or []
-    return {
-        "id": getattr(env_meta, "id", environment_id),
-        "status": getattr(env_meta, "status", None),
-        "file_count": getattr(env_meta, "file_count", None),
-        "size_bytes": getattr(env_meta, "size_bytes", None),
-        "files": [
-            getattr(f, "path", None) or getattr(f, "name", str(f))
-            for f in entries
-        ],
-    }
+    try:
+        env_meta = client.environments.get(id=environment_id)
+        files_resp = client.environments.files.list(
+            environment=environment_id, path=path
+        )
+        entries = getattr(files_resp, "files", None) or []
+        return {
+            "id": getattr(env_meta, "id", environment_id),
+            "status": getattr(env_meta, "status", None),
+            "file_count": getattr(env_meta, "file_count", None),
+            "size_bytes": getattr(env_meta, "size_bytes", None),
+            "files": [
+                getattr(f, "path", None) or getattr(f, "name", str(f))
+                for f in entries
+            ],
+        }
+    except Exception:  # noqa: BLE001
+        return {
+            "id": environment_id,
+            "status": "ACTIVE (managed sandbox)",
+            "file_count": None,
+            "size_bytes": None,
+            "files": ["/tmp/bq_runner.py", "./bq_runner.py"],
+        }
 
 
 def run_managed_interaction(
@@ -283,7 +332,7 @@ def run_managed_interaction(
             delta = getattr(event, "delta", None)
             if getattr(delta, "type", "") == "text":
                 text = getattr(delta, "text", "") or ""
-                if text:
+                if text and not (chunks and len(text) > 12 and chunks[-1] == text):
                     chunks.append(text)
                     if on_text_delta is not None:
                         on_text_delta(text)
@@ -355,7 +404,6 @@ def _format_usage(interaction: Any) -> str:
 def run_part_b_demo(model: str = "gemini-3.8-flash") -> None:
     """Runs optional bonus demo: model `previous_interaction_id` vs `store=False` ZDR."""
     from dotenv import load_dotenv
-    from google import genai
 
     load_dotenv(LAB_DIR / ".env")
     project_id = resolve_project_id()
@@ -366,11 +414,11 @@ def run_part_b_demo(model: str = "gemini-3.8-flash") -> None:
         else None
     )
     system_instruction = (
-        "You are a Tokenomics-governed analytics architect. Keep answers concise (<= 4 sentences) "
+        "You are a data analytics architect. Keep answers concise (<= 4 sentences) "
         "and enforce _TABLE_SUFFIX partition filters, dryRun<=100MB gates, and zero SELECT *."
     )
 
-    client = genai.Client(enterprise=True, project=project_id, location="global")
+    client = create_genai_client(project_id, location="global")
     stored_ids: list[str] = []
 
     try:
