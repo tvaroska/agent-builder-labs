@@ -3,7 +3,10 @@
 Creates a reusable custom Agent resource on the Gemini Platform (`locations/global`)
 extending a managed `base_agent` with:
 - Remote MCP attachment to the Lab 2 `knowledge-catalog-mcp` Cloud Run server
-- Sandboxed `code_execution` for partition-filtered BigQuery queries
+  (for zero-scan semantic metric and schema discovery)
+- Sandboxed `code_execution` where the agent writes and runs its own Python
+  BigQuery REST tool (`/tmp/bq_runner.py`) with zero BigQuery MCP server,
+  authenticated out-of-band by host egress proxy `transform` headers
 - Portable `SKILL.md` mounting via Skill Registry, Cloud Storage, or inline file
 """
 
@@ -54,8 +57,8 @@ def build_skill_source(
 
 
 def build_egress_allowlist(catalog_mcp_url: str | None) -> list[dict[str, str]]:
-    """Builds a least-privilege sandbox network allowlist for MCP + Google Cloud APIs."""
-    domains = ["bigquery.googleapis.com", "oauth2.googleapis.com", "www.googleapis.com"]
+    """Builds a least-privilege sandbox network allowlist for BigQuery REST + Catalog MCP."""
+    domains = ["bigquery.googleapis.com"]
     if catalog_mcp_url:
         host = urlparse(catalog_mcp_url).hostname
         if host and host not in domains:
@@ -75,10 +78,13 @@ def build_agent_spec(
     """Constructs the declarative `client.agents.create` payload."""
     system_instruction = (
         "You are an enterprise Data Analytics Agent governed by strict Tokenomics rules. "
-        "Before touching BigQuery, consult the mounted tokenomics-analytics skill and "
-        "the knowledge-catalog-mcp tools. Never run BigQuery jobs for metric formulas or "
-        "schema questions. When live rows are requested, enforce _TABLE_SUFFIX partition "
-        f"filters and bill queries to project '{project_id}'."
+        "Read and follow the mounted tokenomics-analytics skill (.agents/skills or ./skills). "
+        "Never run BigQuery jobs for metric formulas or schema questions—resolve those via "
+        "knowledge-catalog-mcp. When live BigQuery rows are requested, build and execute "
+        "/tmp/bq_runner.py inside code_execution against https://bigquery.googleapis.com "
+        f"(billing project '{project_id}', dryRun<=100MB first, _TABLE_SUFFIX required, "
+        "no SELECT *); outbound Authorization headers are injected automatically by the "
+        "sandbox egress proxy."
     )
 
     tools: list[dict[str, Any]] = [
@@ -98,11 +104,14 @@ def build_agent_spec(
     return {
         "id": agent_id,
         "base_agent": base_agent,
-        "description": "Tokenomics-governed BigQuery analytics agent using Knowledge Catalog MCP and portable SKILL.md.",
+        "description": "Tokenomics-governed analytics agent that builds and runs its own sandboxed BigQuery REST tool.",
         "system_instruction": system_instruction,
         "tools": tools,
         "base_environment": {
             "type": "remote",
+            "env": {
+                "GOOGLE_CLOUD_PROJECT": project_id,
+            },
             "sources": [skill_source],
             "network": {
                 "allowlist": build_egress_allowlist(catalog_mcp_url),

@@ -3,7 +3,10 @@
 Contrasts two low-infrastructure patterns that avoid deploying custom agent
 containers or multi-service orchestration frameworks:
 1. Managed Agent Harness (`run_managed_interaction`): delegates tool loops,
-   sandbox execution, and skill discovery to a server-managed Agent resource.
+   sandbox code building/execution, and skill discovery to a server-managed
+   Agent resource, using host egress proxy `transform` headers so sandboxed
+   Python tools can query BigQuery REST APIs with zero MCP server and zero
+   secrets inside sandbox memory.
 2. Thin Model Harness (`run_thin_model_turn`): drives a foundation model over
    `POST .../interactions` using `previous_interaction_id` so `thought_signature`
    and prefix-cache affinity stay server-side without resending history arrays.
@@ -13,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 
 @dataclass
@@ -25,6 +29,65 @@ class ManagedTurnResult:
     total_tokens: int | None = None
     cached_tokens: int | None = None
     thought_tokens: int | None = None
+
+
+def mint_bigquery_access_token() -> str:
+    """Mints a short-lived BigQuery OAuth access token from host ADC."""
+    import google.auth
+    from google.auth.transport.requests import Request
+
+    creds, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/bigquery"]
+    )
+    creds.refresh(Request())
+    if not creds.token:
+        raise RuntimeError("Failed to mint OAuth access token from google.auth.default().")
+    return creds.token
+
+
+def build_bigquery_proxy_environment(
+    project_id: str,
+    *,
+    bq_access_token: str | None = None,
+    catalog_mcp_url: str | None = None,
+    environment_id: str | None = None,
+    sources: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Builds a remote sandbox spec with zero-secret proxy auth to BigQuery.
+
+    When `bq_access_token` is supplied, the Managed Agents host egress proxy
+    injects `Authorization` and `X-Goog-User-Project` headers on outbound TLS
+    connections to `bigquery.googleapis.com`. Python scripts built and executed
+    by the agent inside `code_execution` call the BigQuery REST API directly
+    without an MCP server and without any token present in sandbox env or disk.
+    """
+    bq_rule: dict[str, Any] = {"domain": "bigquery.googleapis.com"}
+    if bq_access_token:
+        bq_rule["transform"] = {
+            "Authorization": f"Bearer {bq_access_token}",
+            "X-Goog-User-Project": project_id,
+        }
+
+    allowlist: list[dict[str, Any]] = [bq_rule]
+    if catalog_mcp_url:
+        host = urlparse(catalog_mcp_url).hostname
+        if host and host != "bigquery.googleapis.com":
+            allowlist.append({"domain": host})
+
+    env_spec: dict[str, Any] = {
+        "type": "remote",
+        "env": {
+            "GOOGLE_CLOUD_PROJECT": project_id,
+        },
+        "network": {
+            "allowlist": allowlist,
+        },
+    }
+    if environment_id:
+        env_spec["environment_id"] = environment_id
+    if sources:
+        env_spec["sources"] = sources
+    return env_spec
 
 
 def run_managed_interaction(
@@ -42,7 +105,7 @@ def run_managed_interaction(
 
     Agent interactions are backed by a durable server-side task; passing the
     returned `environment_id` into subsequent turns reattaches to the same
-    7-day rolling TTL Linux sandbox (preserving local files and packages).
+    7-day rolling TTL Linux sandbox (preserving agent-built scripts and files).
     """
     kwargs: dict[str, Any] = {
         "agent": agent,
@@ -80,7 +143,11 @@ def run_managed_interaction(
         if event_type == "step.start":
             step = getattr(event, "step", None)
             step_type = getattr(step, "type", "")
-            if step_type in ("function_call", "mcp_server_tool_call"):
+            if step_type in (
+                "function_call",
+                "mcp_server_tool_call",
+                "code_execution_call",
+            ):
                 name = getattr(step, "name", None) or step_type
                 result.tool_calls.append(name)
 

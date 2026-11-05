@@ -1,6 +1,6 @@
 ---
 name: tokenomics-analytics
-description: Enforces Tokenomics-governed BigQuery analytics by consulting the Knowledge Catalog MCP server before scanning tables, answering metric and schema questions at zero scan cost, and mandating partition filters on live queries.
+description: Enforces Tokenomics-governed BigQuery analytics by consulting Knowledge Catalog first, answering metric and schema questions at zero scan cost, and building a partition-enforcing Python BigQuery CLI inside code_execution with zero BigQuery MCP dependency.
 ---
 
 # Tokenomics-Governed BigQuery Analytics Skill
@@ -9,22 +9,30 @@ Follow this three-step sequence whenever answering analytics, metric formula, sc
 
 ## 1. Mandatory Knowledge Catalog First (Zero-Scan Circuit Breaker)
 
-- Always query the attached `knowledge-catalog-mcp` MCP tools (`search_knowledge_catalog`, `get_semantic_metric`, `get_table_metadata`) **before** writing or executing any BigQuery SQL.
-- If the user asks a conceptual or metadata question (for example, *"What is our business formula for bounce rate?"*, *"What datasets are available?"*, or *"What are the partition rules for `ga_sessions`?"*):
-  - Answer strictly from the Knowledge Catalog MCP results.
-  - Do **not** invoke BigQuery jobs or `list_datasets` calls.
+- Whenever `knowledge-catalog-mcp` tools (`search_knowledge_catalog`, `get_semantic_metric`, `get_table_metadata`) are attached, consult them **before** touching BigQuery.
+- For conceptual or metadata questions (such as *"What is our business formula for bounce rate?"*, *"What datasets are available?"*, or *"What are the partition rules for `ga_sessions`?"*):
+  - Answer strictly from Knowledge Catalog results.
+  - Do **not** run any BigQuery jobs or table scans.
 
-## 2. Partition-Safe BigQuery Execution (Live Row Queries Only)
+## 2. Self-Built Sandbox BigQuery Tool (`code_execution` — No BigQuery MCP)
 
-Only execute a BigQuery query when the user asks for concrete row values or aggregated numbers that cannot be answered from catalog metadata alone:
+When live row values or aggregations are required, build and execute `/tmp/bq_runner.py` inside the sandbox (`code_execution`) using Python's standard library (`urllib.request`, `json`, `os`, `re`, `sys`):
 
-1. Call `get_table_metadata` first to verify partition columns, sharding suffixes, and cost guardrails.
-2. Never run `SELECT *` on analytical tables; project only the required columns.
-3. For date-sharded tables such as `bigquery-public-data.google_analytics_sample.ga_sessions_*`:
-   - Always filter on `_TABLE_SUFFIX` (for example, `_TABLE_SUFFIX = '20170801'` for a single day or `_TABLE_SUFFIX BETWEEN '20170725' AND '20170801'` for multi-day ranges).
-   - Bill the query to the active `GOOGLE_CLOUD_PROJECT`.
+1. **Zero Ambient Secrets in Code:**
+   - Read the billing project from `os.environ["GOOGLE_CLOUD_PROJECT"]`.
+   - Send HTTPS `POST` requests directly to `https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/queries` (`Content-Type: application/json`).
+   - Do **not** look for `gcloud`, ADC files, or OAuth tokens inside the sandbox—the host egress proxy automatically injects `Authorization` and `X-Goog-User-Project` headers on outbound requests to `bigquery.googleapis.com`.
+2. **Local Pre-Flight SQL Guardrails (Before Any Network Call):**
+   - Reject any query matching `SELECT\s+\*` (case-insensitive).
+   - If the query references `ga_sessions`, reject it unless `_TABLE_SUFFIX` is present in the SQL text.
+3. **Mandatory Dry-Run Byte Gate (`dryRun: true`):**
+   - First `POST` `{"query": sql, "useLegacySql": false, "dryRun": true}`.
+   - Parse `totalBytesProcessed` from the JSON response and abort if `int(totalBytesProcessed) > 100_000_000` (`100 MB`).
+4. **Partition-Safe Execution (`dryRun: false`):**
+   - `POST` `{"query": sql, "useLegacySql": false, "maximumBytesBilled": "100000000"}` (for `bigquery-public-data.google_analytics_sample.ga_sessions_*`, filter `_TABLE_SUFFIX = '20170801'` for single-day or `_TABLE_SUFFIX BETWEEN ...` for date ranges).
+   - Zip `schema.fields` names with each row's `f[].v` values and print structured JSON including `dry_run_bytes` and `rows`.
 
 ## 3. Grounded Reporting
 
-- Quote the exact `_TABLE_SUFFIX` filter and Knowledge Catalog metric definition used.
-- Ensure every number in the final summary appears verbatim in the SQL query result.
+- Cite the `_TABLE_SUFFIX` partition filter, `dry_run_bytes` processed, and Knowledge Catalog definition used.
+- Every numerical figure in the final response must match the `/tmp/bq_runner.py` output verbatim.

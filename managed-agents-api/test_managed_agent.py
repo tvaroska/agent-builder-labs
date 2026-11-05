@@ -25,7 +25,12 @@ from create_managed_agent import (
     build_skill_source,
     wait_for_agent_ready,
 )
-from low_infra_harness import run_managed_interaction, run_thin_model_turn
+from low_infra_harness import (
+    build_bigquery_proxy_environment,
+    mint_bigquery_access_token,
+    run_managed_interaction,
+    run_thin_model_turn,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -33,12 +38,14 @@ from low_infra_harness import run_managed_interaction, run_thin_model_turn
 # ---------------------------------------------------------------------------
 
 
-def test_skill_markdown_has_frontmatter_and_circuit_breaker() -> None:
+def test_skill_markdown_has_frontmatter_circuit_breaker_and_self_built_bq_cli() -> None:
     text = SKILL_FILE.read_text(encoding="utf-8")
     assert text.startswith("---\nname: tokenomics-analytics\n")
     assert "knowledge-catalog-mcp" in text
+    assert "/tmp/bq_runner.py" in text
+    assert "dryRun" in text
     assert "_TABLE_SUFFIX" in text
-    assert "SELECT *" in text
+    assert "SELECT" in text
 
 
 def test_build_skill_source_modes() -> None:
@@ -77,16 +84,42 @@ def test_build_agent_spec_wires_mcp_and_least_privilege_allowlist() -> None:
         "name": "knowledge-catalog-mcp",
         "url": mcp_url,
     } in spec["tools"]
+    assert spec["base_environment"]["env"] == {
+        "GOOGLE_CLOUD_PROJECT": "sample-analytics-proj"
+    }
 
     allowed_domains = {
         entry["domain"] for entry in spec["base_environment"]["network"]["allowlist"]
     }
-    assert "knowledge-catalog-mcp-abc123-uc.a.run.app" in allowed_domains
-    assert "bigquery.googleapis.com" in allowed_domains
-    assert "*" not in allowed_domains
+    assert allowed_domains == {
+        "bigquery.googleapis.com",
+        "knowledge-catalog-mcp-abc123-uc.a.run.app",
+    }
 
 
-def test_run_managed_interaction_collects_text_tools_and_env_id() -> None:
+def test_build_bigquery_proxy_environment_injects_headers_outside_sandbox() -> None:
+    env_spec = build_bigquery_proxy_environment(
+        "qwiklabs-gcp-01-demo",
+        bq_access_token="stub-ephemeral-token",
+        catalog_mcp_url="https://knowledge-catalog-mcp-xyz-uc.a.run.app/sse",
+        environment_id="env_persist_001",
+    )
+    assert env_spec["type"] == "remote"
+    assert env_spec["environment_id"] == "env_persist_001"
+    # Token must NEVER appear in sandbox environment variables
+    assert env_spec["env"] == {"GOOGLE_CLOUD_PROJECT": "qwiklabs-gcp-01-demo"}
+    assert "stub-ephemeral-token" not in str(env_spec["env"])
+
+    allowlist = env_spec["network"]["allowlist"]
+    bq_entry = next(r for r in allowlist if r["domain"] == "bigquery.googleapis.com")
+    assert bq_entry["transform"] == {
+        "Authorization": "Bearer stub-ephemeral-token",
+        "X-Goog-User-Project": "qwiklabs-gcp-01-demo",
+    }
+    assert {"domain": "knowledge-catalog-mcp-xyz-uc.a.run.app"} in allowlist
+
+
+def test_run_managed_interaction_collects_text_code_execution_and_env_id() -> None:
     events = [
         types.SimpleNamespace(
             event_type="interaction.created",
@@ -96,17 +129,15 @@ def test_run_managed_interaction_collects_text_tools_and_env_id() -> None:
         ),
         types.SimpleNamespace(
             event_type="step.start",
-            step=types.SimpleNamespace(
-                type="mcp_server_tool_call", name="get_semantic_metric"
-            ),
+            step=types.SimpleNamespace(type="code_execution_call", name=None),
         ),
         types.SimpleNamespace(
             event_type="step.delta",
-            delta=types.SimpleNamespace(type="text", text="Bounce rate uses "),
+            delta=types.SimpleNamespace(type="text", text="Top source: "),
         ),
         types.SimpleNamespace(
             event_type="step.delta",
-            delta=types.SimpleNamespace(type="text", text="COUNTIF(totals.bounces = 1)."),
+            delta=types.SimpleNamespace(type="text", text="(direct) with 1,240 sessions."),
         ),
         types.SimpleNamespace(
             event_type="interaction.completed",
@@ -136,17 +167,18 @@ def test_run_managed_interaction_collects_text_tools_and_env_id() -> None:
     turn = run_managed_interaction(
         fake_client,
         agent="demo-agent-01",
-        prompt="What is our business formula for bounce rate?",
-        environment="remote",
+        prompt="Run /tmp/bq_runner.py for 20170801.",
+        environment={"type": "remote", "environment_id": "env_persist_001"},
+        tools=[{"type": "code_execution"}],
     )
 
     assert recorded_kwargs["agent"] == "demo-agent-01"
-    assert recorded_kwargs["environment"] == "remote"
+    assert recorded_kwargs["tools"] == [{"type": "code_execution"}]
     assert turn.interaction_id == "int_1"
     assert turn.environment_id == "env_persist_001"
     assert turn.status == "completed"
-    assert turn.tool_calls == ["get_semantic_metric"]
-    assert turn.output_text == "Bounce rate uses COUNTIF(totals.bounces = 1)."
+    assert turn.tool_calls == ["code_execution_call"]
+    assert turn.output_text == "Top source: (direct) with 1,240 sessions."
     assert turn.cached_tokens == 3600
 
 
@@ -178,7 +210,7 @@ def test_run_thin_model_turn_enforces_zdr_constraint_and_turn_scoped_args() -> N
     assert resp.id == "int_2"
     assert captured["previous_interaction_id"] == "int_1"
     assert captured["system_instruction"] == "Consult catalog first."
-    assert len(build_egress_allowlist(None)) == 3
+    assert build_egress_allowlist(None) == [{"domain": "bigquery.googleapis.com"}]
 
 
 # ---------------------------------------------------------------------------
@@ -221,43 +253,61 @@ def run_live_verification(cleanup: bool = False) -> None:
         t1 = run_managed_interaction(
             client,
             agent=agent_id,
-            prompt="What is our official business formula for bounce rate? Save a short note to /tmp/metric_note.txt.",
-            environment={"type": "remote"},
+            prompt="What is our official business formula for bounce rate?",
+            environment=build_bigquery_proxy_environment(
+                project_id,
+                catalog_mcp_url=catalog_mcp_url,
+            ),
         )
         print(t1.output_text)
         print(f"[State] interaction_id={t1.interaction_id} | environment_id={t1.environment_id}")
         assert "bounces" in t1.output_text.lower() or "countif" in t1.output_text.lower()
 
-        print("\n=== Turn 2: Reusing Persistent Sandbox (`environment_id`) + Partition Spec ===")
+        print("\n=== Turn 2: Build & Unit-Test `/tmp/bq_runner.py` Inside Persistent Sandbox ===")
         t2 = run_managed_interaction(
             client,
             agent=agent_id,
             prompt=(
-                "Confirm /tmp/metric_note.txt still exists in this sandbox, and tell me the "
-                "partition rules for ga_sessions without running any BigQuery SQL."
+                "1. Look up the partition rules for ga_sessions in the Knowledge Catalog without running SQL.\n"
+                "2. In code_execution, write /tmp/bq_runner.py following the tokenomics-analytics skill "
+                "(rejecting SELECT *, requiring _TABLE_SUFFIX on ga_sessions, running dryRun<=100MB first, "
+                "and calling https://bigquery.googleapis.com/bigquery/v2/projects/${GOOGLE_CLOUD_PROJECT}/queries "
+                "using Python stdlib urllib with no Authorization header in code).\n"
+                "3. Run a local self-test in Python confirming /tmp/bq_runner.py rejects 'SELECT * FROM ga_sessions_*' "
+                "and rejects queries missing _TABLE_SUFFIX before making any HTTP request."
             ),
-            environment=t1.environment_id or {"type": "remote"},
+            environment=build_bigquery_proxy_environment(
+                project_id,
+                catalog_mcp_url=catalog_mcp_url,
+                environment_id=t1.environment_id,
+            ),
         )
         print(t2.output_text)
         assert "_TABLE_SUFFIX" in t2.output_text
+        assert "code_execution_call" in t2.tool_calls
 
-        print("\n=== Turn 3: Partitioned BigQuery Execution + Dynamic MCP Override ===")
+        print("\n=== Turn 3: Execute Self-Built BigQuery CLI in Sandbox (Zero MCP Attached!) ===")
+        bq_token = mint_bigquery_access_token()
         t3 = run_managed_interaction(
             client,
             agent=agent_id,
-            prompt="Find the top 3 traffic sources in ga_sessions for August 1, 2017 using the required partition filter.",
-            environment=t2.environment_id or t1.environment_id,
-            tools=[
-                {"type": "code_execution"},
-                {
-                    "type": "mcp_server",
-                    "name": "knowledge-catalog-mcp",
-                    "url": catalog_mcp_url,
-                },
-            ],
+            prompt=(
+                "Using ONLY your /tmp/bq_runner.py CLI in code_execution (no MCP tools), "
+                "find the top 3 traffic sources (trafficSource.source) by visit count in "
+                "`bigquery-public-data.google_analytics_sample.ga_sessions_*` for August 1, 2017 "
+                "(`_TABLE_SUFFIX = '20170801'`), and report both the dry-run bytes processed and the exact counts."
+            ),
+            environment=build_bigquery_proxy_environment(
+                project_id,
+                bq_access_token=bq_token,
+                environment_id=t2.environment_id or t1.environment_id,
+            ),
+            tools=[{"type": "code_execution"}],
         )
         print(t3.output_text)
-        print("\nALL MANAGED AGENTS API GOVERNANCE & STATE CHECKS PASSED!")
+        assert "code_execution_call" in t3.tool_calls
+        assert "mcp_server_tool_call" not in t3.tool_calls
+        print("\nALL MANAGED AGENTS API SELF-BUILT BQ TOOL & GOVERNANCE CHECKS PASSED!")
     finally:
         if cleanup or created_ephemeral:
             client.agents.delete(id=agent_id)
