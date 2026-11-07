@@ -1,0 +1,25 @@
+# Secrets & environment files
+.env
+.env.*
+*.pem
+*.key
+*credentials*.json
+*service-account*.json
+
+# Python caches & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+
+# OS & editor files
+.DS_Store
+.idea/
+.vscode/
